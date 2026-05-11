@@ -10,7 +10,7 @@ EBSCOhost full-text source, handle jAccount login, and trigger the PDF download.
 Install dependencies with uv:
 
 ```bash
-uv add fastapi uvicorn playwright python-dotenv pillow opencv-python onnxruntime pydantic-settings
+uv sync
 uv run python -m playwright install chromium
 ```
 
@@ -19,12 +19,22 @@ Create `.env` from `.env.example` and fill:
 ```text
 Jaccount_Username=...
 Jaccount_PWD=...
-CAPTCHA_MODEL_PATH=models/jaccount_resnet.onnx
+CAPTCHA_MODEL_PATH=models/nn_model.onnx
+CAPTCHA_WIDTH=110
+CAPTCHA_HEIGHT=40
+CAPTCHA_CHARSET=abcdefghijklmnopqrstuvwxyz
 ```
 
-Put the jAccount ONNX captcha model at `models/jaccount_resnet.onnx`, or set
+Put the jAccount ONNX captcha model at `models/nn_model.onnx`, or set
 `CAPTCHA_MODEL_PATH` to the model location. The service performs CPU inference
-with `onnxruntime`.
+with `onnxruntime`. If your ONNX model reports a different input width, update
+`CAPTCHA_WIDTH` to match the model error message.
+
+Captcha recognition is based on the open-source jAccount captcha solver and its
+pretrained ONNX model from
+[LightQuantumArchive/jaccount-captcha-solver](https://github.com/LightQuantumArchive/jaccount-captcha-solver).
+Thanks to the original authors and maintainers for publishing the model and
+training code.
 
 ## Run
 
