@@ -405,19 +405,216 @@ class ScholarDownloadWorkflow:
                 break
             await page.wait_for_timeout(1_000)
 
-        toolbar_download = page.locator('button[aria-label="Download"]').first
-        await toolbar_download.wait_for(timeout=30_000)
-        await toolbar_download.click()
-
-        modal_download = page.locator(
-            'button[title="Download"], '
-            'button.nuc-bulk-download-modal-footer__button:has-text("Download"), '
-            'button:has-text("下载")'
-        ).last
-        await modal_download.wait_for(timeout=15_000)
+        await self._click_ebsco_toolbar_download(page)
         async with page.expect_download(timeout=45_000) as download_info:
-            await modal_download.click()
+            await self._click_ebsco_final_download(page)
         return await download_info.value
+
+    async def _wait_for_ebsco_download_dialog(self, page: Page, timeout: int = 5_000) -> bool:
+        for selector in [
+            'div[role="dialog"]',
+            '[data-auto="bulk-download-modal-download-button"]',
+            'text="选择格式"',
+            'text="PDF（推荐台式计算机使用）"',
+            'text="Select a format"',
+            'text="PDF"',
+        ]:
+            try:
+                await page.locator(selector).first.wait_for(state="visible", timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _click_ebsco_final_download(self, page: Page) -> None:
+        selectors = [
+            '[data-auto="bulk-download-modal-download-button"]',
+            'div[role="dialog"] button[title="Download"]',
+            'div[role="dialog"] button[title="下载"]',
+            'div[role="dialog"] button[aria-label="Download"]',
+            'div[role="dialog"] button[aria-label="下载"]',
+            'div[role="dialog"] button.nuc-bulk-download-modal-footer__button:has-text("Download")',
+            'div[role="dialog"] button:has-text("Download")',
+            'div[role="dialog"] button:has-text("下载")',
+            'button.nuc-bulk-download-modal-footer__button:has-text("Download")',
+            'button.nuc-bulk-download-modal-footer__button:has-text("下载")',
+            'button:has-text("Download")',
+            'button:has-text("下载")',
+            'a[download]',
+            'a[href*="download" i]',
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).last
+            try:
+                await locator.wait_for(state="visible", timeout=2_500)
+                await locator.click(timeout=3_000)
+                return
+            except Exception:
+                continue
+
+        clicked = await page.evaluate(
+            """() => {
+                const visible = el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none';
+                };
+                const dialogs = [...document.querySelectorAll('[role="dialog"], .eb-modal, body')];
+                for (const root of dialogs) {
+                    const buttons = [...root.querySelectorAll('button, [role="button"], a')]
+                        .filter(visible)
+                        .filter(el => /^(下载|Download)$/i.test((el.textContent || '').trim()) ||
+                            /^(下载|Download)$/i.test(el.getAttribute('aria-label') || '') ||
+                            /^(下载|Download)$/i.test(el.getAttribute('title') || ''));
+                    if (buttons.length) {
+                        buttons[buttons.length - 1].click();
+                        return true;
+                    }
+                }
+                const modal = [...document.querySelectorAll('[role="dialog"], .eb-modal, [class*="modal" i]')]
+                    .filter(visible)
+                    .sort((a, b) => b.getBoundingClientRect().width * b.getBoundingClientRect().height -
+                        a.getBoundingClientRect().width * a.getBoundingClientRect().height)[0];
+                if (!modal) {
+                    return false;
+                }
+                const candidates = [...modal.querySelectorAll('button, [role="button"], a')]
+                    .filter(visible)
+                    .sort((a, b) => {
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        return (br.bottom + br.right) - (ar.bottom + ar.right);
+                    });
+                if (!candidates.length) {
+                    return false;
+                }
+                candidates[0].click();
+                return true;
+            }"""
+        )
+        if clicked:
+            return
+
+        diagnostic = await page.evaluate(
+            """() => [...document.querySelectorAll('button, a, [role="button"]')]
+                .map((el, index) => ({
+                    index,
+                    tag: el.tagName,
+                    text: (el.textContent || '').trim().slice(0, 80),
+                    aria: el.getAttribute('aria-label') || '',
+                    title: el.getAttribute('title') || '',
+                    cls: String(el.className || '').slice(0, 120)
+                }))
+                .filter(item => /download|下载|pdf/i.test(
+                    item.text + item.aria + item.title + item.cls
+                ))
+                .slice(0, 20)"""
+        )
+        raise WorkflowError(f"Could not find the EBSCO final download button. Candidates: {diagnostic}")
+
+    async def _click_ebsco_toolbar_download(self, page: Page) -> None:
+        selectors = [
+            'button[data-auto="tool-button"].tools-menu__tool--download__button',
+            '.tools-menu__tool--download button[data-auto="tool-button"]',
+            'button.tools-menu__tool--download__button',
+            'button.tools-menu__tool--download__button[aria-label="Download"]',
+            'button.tools-menu__tool--download__button[aria-label="下载"]',
+            'button[aria-label="Download"] svg[data-icon="download"]',
+            'button[aria-label="下载"] svg[data-icon="download"]',
+            'button:has(svg[data-icon="download"])',
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=8_000)
+                button = locator.locator("xpath=ancestor-or-self::button[1]").first
+                if await button.count() > 0:
+                    locator = button
+                await locator.click(timeout=5_000)
+                if await self._wait_for_ebsco_download_dialog(page, timeout=2_000):
+                    return
+            except Exception:
+                continue
+
+            try:
+                await locator.evaluate(
+                    """element => {
+                        const button = element.closest('button') || element;
+                        button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                        button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        button.click();
+                    }"""
+                )
+                if await self._wait_for_ebsco_download_dialog(page, timeout=2_000):
+                    return
+            except Exception:
+                continue
+
+        # EBSCO sometimes renders the toolbar icon without accessible labels.
+        # Click the visible top toolbar button whose center is nearest the
+        # screenshot position of the download icon.
+        clicked = await page.evaluate(
+            """() => {
+                const candidates = [...document.querySelectorAll('button, [role="button"], a')]
+                    .map(el => {
+                        const rect = el.getBoundingClientRect();
+                        return { el, rect };
+                    })
+                    .filter(({ rect }) =>
+                        rect.width >= 24 &&
+                        rect.height >= 24 &&
+                        rect.top >= 0 &&
+                        rect.top <= 90 &&
+                        rect.left > window.innerWidth * 0.55
+                    )
+                    .sort((a, b) => {
+                        const ax = a.rect.left + a.rect.width / 2;
+                        const bx = b.rect.left + b.rect.width / 2;
+                        const ay = a.rect.top + a.rect.height / 2;
+                        const by = b.rect.top + b.rect.height / 2;
+                        const targetX = window.innerWidth * 0.83;
+                        const targetY = 34;
+                        return Math.hypot(ax - targetX, ay - targetY) -
+                            Math.hypot(bx - targetX, by - targetY);
+                    });
+                if (!candidates.length) {
+                    return false;
+                }
+                candidates[0].el.click();
+                return true;
+            }"""
+        )
+        if clicked and await self._wait_for_ebsco_download_dialog(page, timeout=3_000):
+            return
+
+        diagnostic = await page.evaluate(
+            """() => [...document.querySelectorAll('button, a, [role="button"]')]
+                .map((el, index) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        index,
+                        tag: el.tagName,
+                        text: (el.textContent || '').trim().slice(0, 80),
+                        aria: el.getAttribute('aria-label') || '',
+                        title: el.getAttribute('title') || '',
+                        dataAuto: el.getAttribute('data-auto') || '',
+                        cls: String(el.className || '').slice(0, 120),
+                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                    };
+                })
+                .filter(item => /download|下载|tool-button/i.test(
+                    item.text + item.aria + item.title + item.dataAuto + item.cls
+                ))
+                .slice(0, 30)"""
+        )
+        raise WorkflowError(
+            "EBSCO download dialog did not appear after clicking the toolbar download button. "
+            f"Toolbar candidates: {diagnostic}"
+        )
 
     async def _dismiss_cookie_banners(self, page: Page) -> None:
         for text in ["Accept All", "Reject All", "接受全部", "全部接受"]:
