@@ -24,6 +24,10 @@ class DownloadResponse(BaseModel):
     status: TaskStatus
 
 
+class CaptchaSubmission(BaseModel):
+    text: str = Field(min_length=1, max_length=12)
+
+
 class TaskSnapshot(BaseModel):
     task_id: str
     status: TaskStatus
@@ -39,4 +43,3 @@ class TaskSnapshot(BaseModel):
 class WorkflowResult(BaseModel):
     path: Path | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-

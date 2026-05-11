@@ -50,3 +50,50 @@
   color: #2b6cb0;
 }
 
+.sjtu-paper-captcha-panel {
+  align-items: center;
+  background: #fff;
+  border: 1px solid #c8d3df;
+  border-radius: 6px;
+  display: inline-flex;
+  gap: 8px;
+  margin: 6px 0 4px;
+  padding: 7px;
+}
+
+.sjtu-paper-captcha-panel img {
+  border: 1px solid #ddd;
+  height: 34px;
+  object-fit: contain;
+  width: 120px;
+}
+
+.sjtu-paper-captcha-panel input {
+  border: 1px solid #aaa;
+  border-radius: 4px;
+  box-sizing: border-box;
+  font: 13px/1.4 Arial, sans-serif;
+  padding: 4px 6px;
+  width: 92px;
+}
+
+.sjtu-paper-captcha-panel button {
+  background: #006a4e;
+  border: 1px solid #00513b;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font: 12px/1.4 Arial, sans-serif;
+  padding: 4px 8px;
+}
+
+.sjtu-paper-captcha-panel button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.sjtu-paper-captcha-message {
+  color: #555;
+  font: 12px/1.4 Arial, sans-serif;
+  min-width: 64px;
+}

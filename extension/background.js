@@ -22,6 +22,9 @@ async function handleMessage(message) {
   if (message?.type === "getTask") {
     return getTask(message.taskId);
   }
+  if (message?.type === "submitCaptcha") {
+    return submitCaptcha(message.taskId, message.text);
+  }
   if (message?.type === "health") {
     return health();
   }
@@ -56,6 +59,16 @@ async function getTask(taskId) {
   return parseResponse(response);
 }
 
+async function submitCaptcha(taskId, text) {
+  const config = await settings();
+  const response = await fetch(`${config.backendUrl}/tasks/${taskId}/captcha`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text })
+  });
+  return parseResponse(response);
+}
+
 async function health() {
   const config = await settings();
   const response = await fetch(`${config.backendUrl}/health`);
@@ -81,4 +94,3 @@ async function parseResponse(response) {
 function normalizeBackendUrl(value) {
   return String(value).replace(/\/+$/, "");
 }
-

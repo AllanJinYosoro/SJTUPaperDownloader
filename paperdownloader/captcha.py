@@ -17,6 +17,7 @@ class JAccountCaptchaSolver:
         self.model_path = Path(settings.captcha_model_path)
         self.charset = settings.captcha_charset
         self._session: ort.InferenceSession | None = None
+        self.last_diagnostics: str = ""
 
     def available(self) -> bool:
         return self.model_path.exists()
@@ -30,9 +31,12 @@ class JAccountCaptchaSolver:
         session = self._get_session()
         input_name = session.get_inputs()[0].name
         outputs = session.run(None, {input_name: self._preprocess(image_bytes)})
+        self.last_diagnostics = self._diagnostics(session, outputs)
         text = self._decode(outputs)
         if not text:
-            raise CaptchaSolverError("Captcha model returned an empty prediction.")
+            raise CaptchaSolverError(
+                f"Captcha model returned an empty prediction. {self.last_diagnostics}"
+            )
         return text
 
     def _get_session(self) -> ort.InferenceSession:
@@ -62,10 +66,8 @@ class JAccountCaptchaSolver:
             return self._decode_multi_head(output)
 
         logits = np.asarray(output[0] if isinstance(output, list) else output)
-        if logits.ndim == 3:
-            logits = logits[0]
-        if logits.ndim == 2:
-            indexes = logits.argmax(axis=-1)
+        if logits.ndim >= 2 and logits.shape[-1] in {len(self.charset), len(self.charset) + 1}:
+            indexes = logits.reshape(-1, logits.shape[-1]).argmax(axis=-1)
         elif logits.ndim == 1:
             indexes = logits.astype(np.int64)
         else:
@@ -89,7 +91,15 @@ class JAccountCaptchaSolver:
         chars: list[str] = []
         for raw_logits in outputs:
             logits = np.asarray(raw_logits)
-            index = int(logits.reshape(-1).argmax())
+            if logits.ndim >= 2 and logits.shape[-1] in {len(self.charset), len(self.charset) + 1}:
+                index = int(logits.reshape(-1, logits.shape[-1])[0].argmax())
+            else:
+                index = int(logits.reshape(-1).argmax())
             if 0 <= index < len(self.charset):
                 chars.append(self.charset[index])
         return "".join(chars)
+
+    def _diagnostics(self, session: ort.InferenceSession, outputs: list[object]) -> str:
+        input_shapes = [(item.name, item.shape) for item in session.get_inputs()]
+        output_shapes = [np.asarray(item).shape for item in outputs]
+        return f"ONNX inputs={input_shapes}; outputs={output_shapes}"

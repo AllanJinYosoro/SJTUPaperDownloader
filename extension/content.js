@@ -1,5 +1,6 @@
 const BUTTON_CLASS = "sjtu-paper-download-button";
 const STATUS_CLASS = "sjtu-paper-download-status";
+const CAPTCHA_CLASS = "sjtu-paper-captcha-panel";
 
 injectButtons();
 
@@ -73,13 +74,21 @@ async function pollTask(button, result, taskId) {
     }
     const task = response.data;
     if (task.status === "success") {
+      removeCaptchaPrompt(result);
       setState(button, result, "success", "Downloaded");
       return;
     }
     if (task.status === "error") {
+      removeCaptchaPrompt(result);
       setState(button, result, "error", task.error || "Failed");
       return;
     }
+    if (task.metadata?.captcha_required && task.metadata?.captcha_image) {
+      setState(button, result, "running", "Captcha needed");
+      renderCaptchaPrompt(result, taskId, task.metadata.captcha_image);
+      continue;
+    }
+    removeCaptchaPrompt(result);
     setState(button, result, "running", task.step || task.status);
   }
 }
@@ -98,3 +107,63 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function renderCaptchaPrompt(result, taskId, imageData) {
+  let panel = result.querySelector(`.${CAPTCHA_CLASS}`);
+  if (panel?.dataset.image === imageData) {
+    return;
+  }
+  removeCaptchaPrompt(result);
+
+  panel = document.createElement("form");
+  panel.className = CAPTCHA_CLASS;
+  panel.dataset.image = imageData;
+
+  const image = document.createElement("img");
+  image.src = imageData;
+  image.alt = "JAccount captcha";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.inputMode = "latin";
+  input.maxLength = 8;
+  input.placeholder = "验证码";
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "提交";
+
+  const message = document.createElement("span");
+  message.className = "sjtu-paper-captcha-message";
+
+  panel.append(image, input, submit, message);
+  panel.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) {
+      message.textContent = "请输入验证码";
+      return;
+    }
+    submit.disabled = true;
+    message.textContent = "Submitting";
+    const response = await chrome.runtime.sendMessage({
+      type: "submitCaptcha",
+      taskId,
+      text
+    });
+    if (!response?.ok) {
+      submit.disabled = false;
+      message.textContent = response?.error || "提交失败";
+      return;
+    }
+    message.textContent = "Submitted";
+  });
+
+  const container = result.querySelector(".sjtu-paper-download-container");
+  container?.insertAdjacentElement("afterend", panel);
+  input.focus();
+}
+
+function removeCaptchaPrompt(result) {
+  result.querySelector(`.${CAPTCHA_CLASS}`)?.remove();
+}

@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Awaitable, Callable
 from urllib.parse import quote
 
 from playwright.async_api import (
@@ -22,9 +23,15 @@ class WorkflowError(RuntimeError):
 
 
 class ScholarDownloadWorkflow:
-    def __init__(self, settings: Settings, captcha_solver: JAccountCaptchaSolver) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        captcha_solver: JAccountCaptchaSolver,
+        captcha_prompt: Callable[[bytes], Awaitable[str]] | None = None,
+    ) -> None:
         self.settings = settings
         self.captcha_solver = captcha_solver
+        self.captcha_prompt = captcha_prompt
 
     async def run(self, title: str, *, headless: bool | None = None) -> WorkflowResult:
         profile_dir = Path(self.settings.browser_profile_dir)
@@ -239,46 +246,157 @@ class ScholarDownloadWorkflow:
         if not self.settings.jaccount_username or not self.settings.jaccount_password:
             raise WorkflowError("JAccount credentials are missing in .env.")
 
-        username = await self._optional_first_visible(
-            page.locator(
-                'input[name*="user" i], input[id*="user" i], '
-                'input[name*="account" i], input[type="text"]'
-            )
-        )
-        password = await self._optional_first_visible(page.locator('input[type="password"]'))
-        if username is not None:
-            await username.fill(self.settings.jaccount_username)
-        if password is not None:
-            await password.fill(self.settings.jaccount_password)
+        username = await self._find_jaccount_username_input(page)
+        password = await self._find_jaccount_password_input(page)
+        if username is None:
+            raise WorkflowError("Could not find the JAccount username input.")
+        if password is None:
+            raise WorkflowError("Could not find the JAccount password input.")
+        await self._fill_input(username, self.settings.jaccount_username)
+        await self._fill_input(password, self.settings.jaccount_password)
 
         for _ in range(self.settings.captcha_max_retries):
-            captcha_input = await self._optional_first_visible(
-                page.locator(
-                    'input[name*="captcha" i], input[id*="captcha" i], '
-                    'input[placeholder*="验证码"], input[type="text"]'
-                )
-            )
-            captcha_image = await self._optional_first_visible(
-                page.locator('img[src*="captcha" i], img[id*="captcha" i], img[alt*="验证码"]')
-            )
-            if captcha_input is not None and captcha_image is not None:
+            captcha_input = await self._find_jaccount_captcha_input(page)
+            if captcha_input is not None:
                 try:
-                    prediction = self.captcha_solver.solve(await captcha_image.screenshot())
-                    await captcha_input.fill(prediction)
+                    image_bytes = await self._screenshot_jaccount_captcha(page, captcha_input)
+                    self._save_debug_captcha(image_bytes)
+                    prediction = self.captcha_solver.solve(image_bytes)
+                    if len(prediction) < 4:
+                        if self.captcha_prompt is None:
+                            raise WorkflowError(
+                                f"Captcha recognition returned too few characters: {prediction!r}. "
+                                "This indicates a recognition/crop issue, not an input issue. "
+                                f"{self.captcha_solver.last_diagnostics}. "
+                                "Saved the exact captcha image sent to ONNX at "
+                                ".debug/jaccount-captcha-last.png."
+                            )
+                        prediction = await self.captcha_prompt(image_bytes)
+                    await self._fill_input(captcha_input, prediction)
+                    actual = await captcha_input.input_value()
+                    if actual != prediction:
+                        raise WorkflowError(
+                            f"Captcha input mismatch after fill. Recognized {prediction!r}, "
+                            f"but the page field contains {actual!r}. This indicates an input-field issue."
+                        )
                 except CaptchaSolverError as exc:
                     raise WorkflowError(str(exc)) from exc
-            if await self._try_click_text(page, ["登录", "Login", "Sign in"]):
-                await page.wait_for_timeout(2_000)
-                if not await self._page_contains(page, ["验证码错误", "captcha incorrect"]):
-                    return
-            elif password is not None:
-                await password.press("Enter")
-                await page.wait_for_timeout(2_000)
+            else:
+                raise WorkflowError("Could not find the JAccount captcha input.")
+            if await self._submit_jaccount_login(page, password):
                 return
-            if captcha_image is not None:
-                await captcha_image.click()
-                await page.wait_for_timeout(500)
+            if self.captcha_prompt is not None:
+                captcha_input = await self._find_jaccount_captcha_input(page)
+                if captcha_input is None:
+                    raise WorkflowError("Could not find the JAccount captcha input after failed captcha.")
+                image_bytes = await self._screenshot_jaccount_captcha(page, captcha_input)
+                self._save_debug_captcha(image_bytes)
+                human_text = await self.captcha_prompt(image_bytes)
+                await self._fill_input(captcha_input, human_text)
+                actual = await captcha_input.input_value()
+                if actual != human_text:
+                    raise WorkflowError(
+                        f"Captcha input mismatch after human fill. Expected {human_text!r}, "
+                        f"but the page field contains {actual!r}."
+                    )
+                if await self._submit_jaccount_login(page, password):
+                    return
         raise WorkflowError("JAccount login failed after captcha retries.")
+
+    async def _submit_jaccount_login(self, page: Page, password: Locator) -> bool:
+        if not await self._try_click_text(page, ["登录", "Login", "Sign in"]):
+            await password.press("Enter")
+        await page.wait_for_timeout(2_000)
+        return not await self._page_contains(page, ["验证码错误", "captcha incorrect"])
+
+    async def _find_jaccount_username_input(self, page: Page) -> Locator | None:
+        return await self._optional_first_visible(
+            page.locator(
+                'input[placeholder*="用户名"], input[placeholder*="账号"], '
+                'input[placeholder*="jAccount" i], input[name*="user" i], '
+                'input[id*="user" i], input[name*="account" i], input[id*="account" i]'
+            )
+        )
+
+    async def _fill_input(self, locator: Locator, value: str) -> None:
+        await locator.fill(value)
+        try:
+            if await locator.input_value(timeout=2_000) == value:
+                return
+        except Exception:
+            pass
+        await locator.evaluate(
+            """(element, text) => {
+                const prototype = Object.getPrototypeOf(element);
+                const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(element, text);
+                } else {
+                    element.value = text;
+                }
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            value,
+        )
+
+    async def _find_jaccount_password_input(self, page: Page) -> Locator | None:
+        return await self._optional_first_visible(
+            page.locator('input[type="password"], input[placeholder*="密码"]')
+        )
+
+    async def _find_jaccount_captcha_input(self, page: Page) -> Locator | None:
+        captcha = await self._optional_first_visible(
+            page.locator(
+                'input[placeholder*="验证码"], input[name*="captcha" i], '
+                'input[id*="captcha" i], input[name*="vcode" i], input[id*="vcode" i]'
+            )
+        )
+        if captcha is not None:
+            return captcha
+
+        text_inputs = page.locator('input[type="text"], input:not([type])')
+        count = await text_inputs.count()
+        visible: list[Locator] = []
+        for index in range(min(count, 12)):
+            item = text_inputs.nth(index)
+            try:
+                if await item.is_visible(timeout=1_000):
+                    visible.append(item)
+            except Exception:
+                continue
+        if len(visible) >= 2:
+            return visible[-1]
+        return None
+
+    async def _screenshot_jaccount_captcha(self, page: Page, captcha_input: Locator) -> bytes:
+        captcha_image = await self._optional_first_visible(
+            page.locator(
+                'img[src*="captcha" i], img[id*="captcha" i], img[name*="captcha" i], '
+                'img[alt*="验证码"], img[alt*="captcha" i]'
+            )
+        )
+        if captcha_image is not None:
+            return await captcha_image.screenshot()
+
+        box = await captcha_input.bounding_box()
+        if box is None:
+            raise WorkflowError("Could not locate the JAccount captcha area.")
+        clip_x = box["x"] + box["width"] * 0.45
+        clip_width = box["width"] * 0.52
+        return await page.screenshot(
+            clip={
+                "x": clip_x,
+                "y": box["y"],
+                "width": clip_width,
+                "height": box["height"],
+            }
+        )
+
+    def _save_debug_captcha(self, image_bytes: bytes) -> None:
+        debug_dir = Path(".debug")
+        debug_dir.mkdir(exist_ok=True)
+        (debug_dir / "jaccount-captcha-last.png").write_bytes(image_bytes)
 
     async def _download_pdf(self, page: Page) -> Download:
         await self._dismiss_cookie_banners(page)
