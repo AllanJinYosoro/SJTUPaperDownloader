@@ -203,7 +203,18 @@ class ScholarDownloadWorkflow:
         )
         if box is None:
             return
-        await box.fill("Shanghai Jiao Tong University")
+        if await self._search_and_select_institution(page, box, "上海交通大学"):
+            return
+        if await self._search_and_select_institution(page, box, "Shanghai Jiao Tong University"):
+            return
+
+    async def _search_and_select_institution(
+        self,
+        page: Page,
+        box: Locator,
+        query: str,
+    ) -> bool:
+        await box.fill(query)
         await page.wait_for_timeout(800)
         search = page.locator('button[aria-label="Search"], button[aria-label*="Search" i]').first
         try:
@@ -211,16 +222,16 @@ class ScholarDownloadWorkflow:
         except Exception:
             await box.press("Enter")
         await page.wait_for_timeout(4_000)
-        try:
-            await page.get_by_text("SHANGHAI JIAOTONG UNIV", exact=True).click(timeout=10_000)
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(4_000)
-            return
-        except Exception:
-            pass
-        if await self._try_click_text(page, ["Shanghai Jiao Tong University", "上海交通大学"]):
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(4_000)
+
+        for text in ["上海交通大学", "SHANGHAI JIAOTONG UNIV", "Shanghai Jiao Tong University"]:
+            try:
+                await page.get_by_text(text, exact=True).click(timeout=5_000)
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(4_000)
+                return True
+            except Exception:
+                continue
+        return False
 
     async def _maybe_login_jaccount(self, page: Page) -> None:
         if not await self._page_contains(page, ["jAccount", "JAccount", "验证码", "captcha"]):
