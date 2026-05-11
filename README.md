@@ -19,11 +19,15 @@ Create `.env` from `.env.example` and fill:
 ```text
 Jaccount_Username=...
 Jaccount_PWD=...
+PORT=8765
 CAPTCHA_MODEL_PATH=models/nn_model.onnx
 CAPTCHA_WIDTH=110
 CAPTCHA_HEIGHT=40
 CAPTCHA_CHARSET=abcdefghijklmnopqrstuvwxyz
 ```
+
+`PORT` can be set in `.env` to change the local service port. The default port is
+`8765`.
 
 Put the jAccount ONNX captcha model at `models/nn_model.onnx`, or set
 `CAPTCHA_MODEL_PATH` to the model location. The service performs CPU inference
@@ -53,6 +57,11 @@ Load `extension/` as an unpacked Chrome extension:
 
 The popup controls the local service URL and whether Playwright runs headless.
 The default service URL is `http://127.0.0.1:8765`.
+
+If you change the default `PORT`, update the Chrome extension's backend URL as
+well. For a permanent default, change `http://127.0.0.1:8765` in
+`extension/popup.js` and `extension/background.js`; otherwise set the new URL in
+the extension popup after loading it.
 
 ## Notes
 
