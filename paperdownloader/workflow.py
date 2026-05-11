@@ -59,7 +59,7 @@ class ScholarDownloadWorkflow:
         await self._open_sjtu_search(page, title)
         await self._validate_primo_first_result(page, title)
         await self._open_online_full_text(page)
-        await self._open_ebsco_source(page)
+        page = await self._open_ebsco_source(page)
         await self._handle_ebsco_auth(page)
         download = await self._download_pdf(page)
         path = await self._resolve_download_path(download)
@@ -72,22 +72,12 @@ class ScholarDownloadWorkflow:
         )
 
     async def _open_sjtu_search(self, page: Page, title: str) -> None:
-        await page.goto("https://www.lib.sjtu.edu.cn/f/main/index.shtml", wait_until="domcontentloaded")
-        try:
-            search_box = await self._first_visible(
-                page.locator('input[type="text"], input[type="search"], textarea')
-            )
-            await search_box.fill(title)
-            await self._try_click_text(page, ["外文电子资源", "Foreign"])
-            await self._try_click_text(page, ["搜索", "Search"])
-            await page.wait_for_load_state("domcontentloaded")
-        except Exception:
-            direct = (
-                "https://86sjt-primo.hosted.exlibrisgroup.com.cn/primo-explore/search"
-                f"?query=any,contains,{quote(title)}"
-                "&tab=paper_tab&search_scope=paper_foreign&vid=fer&offset=0"
-            )
-            await page.goto(direct, wait_until="domcontentloaded")
+        direct = (
+            "https://86sjt-primo.hosted.exlibrisgroup.com.cn/primo-explore/search"
+            f"?query=any,contains,{quote(title)}"
+            "&tab=paper_tab&search_scope=paper_foreign&vid=fer&offset=0"
+        )
+        await page.goto(direct, wait_until="domcontentloaded")
 
     async def _validate_primo_first_result(self, page: Page, title: str) -> None:
         await page.wait_for_load_state("networkidle")
@@ -125,37 +115,65 @@ class ScholarDownloadWorkflow:
         )
 
     async def _open_online_full_text(self, page: Page) -> None:
+        if "/search?" in page.url:
+            full_display_url = await page.evaluate(
+                """() => {
+                    const result = document.querySelector('prm-brief-result');
+                    const links = result ? [...result.querySelectorAll('a[href*="fulldisplay"]')] : [];
+                    const titleLink = links.find(a => (a.textContent || '').trim().length > 5);
+                    return titleLink ? titleLink.href : (links[0] ? links[0].href : null);
+                }"""
+            )
+            if not full_display_url:
+                raise WorkflowError("Could not find the first Primo full-display link.")
+            await page.goto(full_display_url, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle")
+            try:
+                await page.locator(
+                    'a[href*="sfx-86sjtu.hosted.exlibrisgroup.com.cn"]'
+                ).first.wait_for(timeout=20_000)
+            except PlaywrightTimeoutError:
+                pass
+
+        sfx_url = await page.evaluate(
+            """() => {
+                const links = [...document.querySelectorAll('a[href*="sfx-86sjtu.hosted.exlibrisgroup.com.cn"]')];
+                const fullText = links.find(a => /在线资源|更多选项|full/i.test(a.textContent || a.getAttribute('aria-label') || ''));
+                return fullText ? fullText.href : (links[0] ? links[0].href : null);
+            }"""
+        )
+        if sfx_url:
+            await page.goto(sfx_url, wait_until="domcontentloaded")
+            return
+
         if await self._try_click_text(page, ["在线全文", "Online Access", "Full text available"]):
             await page.wait_for_load_state("domcontentloaded")
             return
-        raise WorkflowError("Could not find the Primo '在线全文' link.")
+        raise WorkflowError("Could not find the Primo full-text service link.")
 
-    async def _open_ebsco_source(self, page: Page) -> None:
+    async def _open_ebsco_source(self, page: Page) -> Page:
         await page.wait_for_load_state("networkidle")
-        clicked = await page.evaluate(
+        row_id = await page.evaluate(
             """() => {
-                const blocks = [...document.querySelectorAll('li, tr, div, p')]
-                    .filter(el => /EBSCOhost/i.test(el.textContent || ''));
-                for (const block of blocks) {
-                    const link = [...block.querySelectorAll('a')]
-                        .find(a => /full text available via|全文|full text|EBSCOhost/i.test(a.textContent || a.href));
-                    if (link) {
-                        link.click();
-                        return true;
-                    }
-                }
-                const fallback = [...document.querySelectorAll('a')]
-                    .find(a => /EBSCOhost/i.test(a.textContent || a.href));
-                if (fallback) {
-                    fallback.click();
-                    return true;
-                }
-                return false;
+                const row = [...document.querySelectorAll('tr[id^="tr_"]')]
+                    .find(tr => /EBSCOhost/i.test(tr.textContent || ''));
+                return row ? row.id : null;
             }"""
         )
-        if not clicked:
+        if not row_id:
             raise WorkflowError("No EBSCOhost full-text source was available.")
-        await page.wait_for_load_state("domcontentloaded")
+        link = page.locator(f"tr#{row_id} a").filter(has_text="Full text available via").first
+
+        try:
+            async with page.context.expect_page(timeout=15_000) as popup_info:
+                await link.click(timeout=10_000)
+            ebsco_page = await popup_info.value
+            await ebsco_page.wait_for_load_state("domcontentloaded")
+            return ebsco_page
+        except PlaywrightTimeoutError:
+            await link.click(timeout=10_000)
+            await page.wait_for_load_state("domcontentloaded")
+            return page
 
     async def _handle_ebsco_auth(self, page: Page) -> None:
         for _ in range(8):
@@ -170,20 +188,39 @@ class ScholarDownloadWorkflow:
             await page.wait_for_timeout(1_000)
 
     async def _maybe_select_institution(self, page: Page) -> None:
+        await self._dismiss_cookie_banners(page)
+        if "research.ebsco.com" in page.url and "/viewer/pdf/" in page.url:
+            return
         if await self._try_click_text(page, ["通过您的机构访问", "Access through your institution"]):
             await page.wait_for_load_state("domcontentloaded")
-        if not await self._page_contains(page, ["按名称", "institution", "机构"]):
+        if not await self._page_contains(page, ["Search by name", "institution", "机构"]):
             return
         box = await self._optional_first_visible(
-            page.locator('input[type="text"], input[type="search"]')
+            page.locator(
+                '#fmo_input_type_field_id, input[aria-label*="organization" i], '
+                'input[aria-label*="institution" i], input[type="search"], input[type="text"]'
+            )
         )
         if box is None:
             return
-        await box.fill("上海交通大学")
+        await box.fill("Shanghai Jiao Tong University")
         await page.wait_for_timeout(800)
-        await box.press("Enter")
-        await page.wait_for_timeout(1_500)
-        await self._try_click_text(page, ["上海交通大学", "Shanghai Jiao Tong University"])
+        search = page.locator('button[aria-label="Search"], button[aria-label*="Search" i]').first
+        try:
+            await search.click(timeout=5_000)
+        except Exception:
+            await box.press("Enter")
+        await page.wait_for_timeout(4_000)
+        try:
+            await page.get_by_text("SHANGHAI JIAOTONG UNIV", exact=True).click(timeout=10_000)
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(4_000)
+            return
+        except Exception:
+            pass
+        if await self._try_click_text(page, ["Shanghai Jiao Tong University", "上海交通大学"]):
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(4_000)
 
     async def _maybe_login_jaccount(self, page: Page) -> None:
         if not await self._page_contains(page, ["jAccount", "JAccount", "验证码", "captcha"]):
@@ -233,26 +270,51 @@ class ScholarDownloadWorkflow:
         raise WorkflowError("JAccount login failed after captcha retries.")
 
     async def _download_pdf(self, page: Page) -> Download:
+        await self._dismiss_cookie_banners(page)
         for _ in range(20):
             if "research.ebsco.com" in page.url:
                 break
             await page.wait_for_timeout(1_000)
-        button_texts = ["下载", "Download"]
+
+        toolbar_download = page.locator('button[aria-label="Download"]').first
+        await toolbar_download.wait_for(timeout=30_000)
+        await toolbar_download.click()
+
+        modal_download = page.locator(
+            'button[title="Download"], '
+            'button.nuc-bulk-download-modal-footer__button:has-text("Download"), '
+            'button:has-text("下载")'
+        ).last
+        await modal_download.wait_for(timeout=15_000)
         async with page.expect_download(timeout=45_000) as download_info:
-            if not await self._try_click_text(page, button_texts):
-                await page.locator(
-                    'button[aria-label*="Download" i], button[title*="Download" i], '
-                    'a[aria-label*="Download" i]'
-                ).first.click()
-            await page.wait_for_timeout(700)
-            await self._try_click_text(page, button_texts)
+            await modal_download.click()
         return await download_info.value
 
+    async def _dismiss_cookie_banners(self, page: Page) -> None:
+        for text in ["Accept All", "Reject All", "接受全部", "全部接受"]:
+            try:
+                await page.get_by_text(text, exact=False).first.click(timeout=2_000)
+                await page.wait_for_timeout(500)
+                return
+            except Exception:
+                continue
+
     async def _resolve_download_path(self, download: Download) -> Path | None:
-        path = await download.path()
-        if path is not None:
-            return Path(path)
-        return None
+        target = Path(self.settings.download_dir).expanduser() / download.suggested_filename
+        target = self._deduplicate_path(target)
+        await download.save_as(str(target))
+        return target
+
+    def _deduplicate_path(self, path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        for index in range(1, 1000):
+            candidate = path.with_name(f"{stem}-{index}{suffix}")
+            if not candidate.exists():
+                return candidate
+        raise WorkflowError(f"Could not choose a unique download path for {path}.")
 
     async def _try_click_text(self, page: Page, texts: list[str]) -> bool:
         for text in texts:
@@ -287,4 +349,3 @@ class ScholarDownloadWorkflow:
             except Exception:
                 continue
         return None
-
