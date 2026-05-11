@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SJTU Paper Downloader</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <label>
+        <span>Local service</span>
+        <input id="backendUrl" type="url" spellcheck="false">
+      </label>
+      <label class="toggle">
+        <input id="headless" type="checkbox">
+        <span>Run browser headless</span>
+      </label>
+      <div class="actions">
+        <button id="save" type="button">Save</button>
+        <button id="check" type="button">Check</button>
+      </div>
+      <p id="status" aria-live="polite"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
+

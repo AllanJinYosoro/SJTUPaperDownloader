@@ -1,0 +1,52 @@
+.sjtu-paper-download-container {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  margin: 6px 0 2px;
+}
+
+.sjtu-paper-download-button {
+  appearance: none;
+  background: #006a4e;
+  border: 1px solid #00513b;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font: 12px/1.4 Arial, sans-serif;
+  padding: 3px 9px;
+}
+
+.sjtu-paper-download-button:hover {
+  background: #005b43;
+}
+
+.sjtu-paper-download-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.sjtu-paper-download-button[data-state="success"] {
+  background: #2b6cb0;
+  border-color: #24548a;
+}
+
+.sjtu-paper-download-button[data-state="error"] {
+  background: #b42318;
+  border-color: #8f1d15;
+}
+
+.sjtu-paper-download-status {
+  color: #555;
+  font: 12px/1.4 Arial, sans-serif;
+  max-width: 360px;
+  overflow-wrap: anywhere;
+}
+
+.sjtu-paper-download-status[data-state="error"] {
+  color: #b42318;
+}
+
+.sjtu-paper-download-status[data-state="success"] {
+  color: #2b6cb0;
+}
+

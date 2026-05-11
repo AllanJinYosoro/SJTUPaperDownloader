@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "SJTU Paper Downloader",
+  "description": "Adds a Google Scholar button that asks a local Playwright service to download PDFs through SJTU library access.",
+  "version": "0.1.0",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://scholar.google.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "SJTU Paper Downloader",
+    "default_popup": "popup.html"
+  }
+}
