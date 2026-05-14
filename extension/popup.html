@@ -9,8 +9,12 @@
   <body>
     <main>
       <label>
-        <span>Local service</span>
-        <input id="backendUrl" type="url" spellcheck="false">
+        <span>Download directory</span>
+        <input id="downloadDir" type="text" spellcheck="false" placeholder="Optional local path">
+      </label>
+      <label>
+        <span>Captcha model path</span>
+        <input id="captchaModelPath" type="text" spellcheck="false" placeholder="Optional local path">
       </label>
       <label class="toggle">
         <input id="headless" type="checkbox">
@@ -18,11 +22,10 @@
       </label>
       <div class="actions">
         <button id="save" type="button">Save</button>
-        <button id="check" type="button">Check</button>
+        <button id="check" type="button">Check host</button>
       </div>
       <p id="status" aria-live="polite"></p>
     </main>
     <script src="popup.js"></script>
   </body>
 </html>
-

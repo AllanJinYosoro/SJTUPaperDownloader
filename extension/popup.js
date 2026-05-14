@@ -1,9 +1,11 @@
 const DEFAULTS = {
-  backendUrl: "http://127.0.0.1:8765",
-  headless: true
+  headless: true,
+  downloadDir: "",
+  captchaModelPath: ""
 };
 
-const backendUrl = document.querySelector("#backendUrl");
+const downloadDir = document.querySelector("#downloadDir");
+const captchaModelPath = document.querySelector("#captchaModelPath");
 const headless = document.querySelector("#headless");
 const status = document.querySelector("#status");
 
@@ -14,13 +16,15 @@ load();
 
 async function load() {
   const values = await chrome.storage.sync.get(DEFAULTS);
-  backendUrl.value = values.backendUrl || DEFAULTS.backendUrl;
+  downloadDir.value = values.downloadDir || DEFAULTS.downloadDir;
+  captchaModelPath.value = values.captchaModelPath || DEFAULTS.captchaModelPath;
   headless.checked = values.headless !== false;
 }
 
 async function save() {
   await chrome.storage.sync.set({
-    backendUrl: backendUrl.value.replace(/\/+$/, "") || DEFAULTS.backendUrl,
+    downloadDir: downloadDir.value.trim(),
+    captchaModelPath: captchaModelPath.value.trim(),
     headless: headless.checked
   });
   setStatus("success", "Saved");
@@ -30,15 +34,15 @@ async function check() {
   await save();
   const response = await chrome.runtime.sendMessage({ type: "health" });
   if (!response?.ok) {
-    setStatus("error", response?.error || "Service unavailable");
+    setStatus("error", response?.error || "Host unavailable");
     return;
   }
   const model = response.data.captcha_model_available ? "model ready" : "model missing";
-  setStatus("success", `Service ready, ${model}`);
+  const platform = response.data.platform || "unknown platform";
+  setStatus("success", `Host ready on ${platform}, ${model}`);
 }
 
 function setStatus(state, message) {
   status.dataset.state = state;
   status.textContent = message;
 }
-
