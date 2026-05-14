@@ -1,30 +1,11 @@
 const DEFAULTS = {
-  headless: true,
-  downloadDir: "",
-  captchaModelPath: ""
+  backendUrl: "http://127.0.0.1:8765",
+  headless: true
 };
-const HOST_NAME = "paperdownloader.host";
-
-let nativePort = null;
-let connectPromise = null;
-let nextRequestId = 1;
-let lastSyncedConfig = "";
-const pendingRequests = new Map();
 
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.sync.get(DEFAULTS);
   await chrome.storage.sync.set({ ...DEFAULTS, ...current });
-});
-
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "sync") {
-    return;
-  }
-  if (!("headless" in changes || "downloadDir" in changes || "captchaModelPath" in changes)) {
-    return;
-  }
-  lastSyncedConfig = "";
-  syncHostConfig().catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -53,116 +34,63 @@ async function handleMessage(message) {
 async function settings() {
   const values = await chrome.storage.sync.get(DEFAULTS);
   return {
-    headless: values.headless !== false,
-    downloadDir: normalizeOptionalPath(values.downloadDir),
-    captchaModelPath: normalizeOptionalPath(values.captchaModelPath)
+    backendUrl: normalizeBackendUrl(values.backendUrl || DEFAULTS.backendUrl),
+    headless: values.headless !== false
   };
 }
 
 async function startDownload(payload) {
   const config = await settings();
-  await syncHostConfig(config);
-  return callHost("startDownload", {
-    title: payload.title,
-    scholarUrl: payload.scholarUrl,
-    headless: config.headless
+  const response = await fetch(`${config.backendUrl}/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: payload.title,
+      scholar_url: payload.scholarUrl,
+      headless: config.headless
+    })
   });
+  return parseResponse(response);
 }
 
 async function getTask(taskId) {
-  return callHost("getTask", { taskId });
+  const config = await settings();
+  const response = await fetch(`${config.backendUrl}/tasks/${taskId}`);
+  return parseResponse(response);
 }
 
 async function submitCaptcha(taskId, text) {
-  return callHost("submitCaptcha", { taskId, text });
+  const config = await settings();
+  const response = await fetch(`${config.backendUrl}/tasks/${taskId}/captcha`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text })
+  });
+  return parseResponse(response);
 }
 
 async function health() {
   const config = await settings();
-  await syncHostConfig(config);
-  return callHost("health", {});
+  const response = await fetch(`${config.backendUrl}/health`);
+  return parseResponse(response);
 }
 
-async function syncHostConfig(config = null) {
-  const resolved = config || await settings();
-  const serialized = JSON.stringify(resolved);
-  if (serialized === lastSyncedConfig) {
-    return;
+async function parseResponse(response) {
+  let body = null;
+  try {
+    body = await response.json();
+  } catch (_error) {
+    body = {};
   }
-  const response = await callHost("updateConfig", {
-    headless: resolved.headless,
-    downloadDir: resolved.downloadDir,
-    captchaModelPath: resolved.captchaModelPath
-  });
-  if (!response?.ok) {
-    throw new Error(response?.error || "Could not sync host configuration");
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: body.detail || body.error || `HTTP ${response.status}`
+    };
   }
-  lastSyncedConfig = serialized;
+  return { ok: true, data: body };
 }
 
-async function callHost(type, payload) {
-  const port = await ensureNativePort();
-  const id = `req-${Date.now()}-${nextRequestId++}`;
-  return new Promise((resolve, reject) => {
-    pendingRequests.set(id, { resolve, reject });
-    try {
-      port.postMessage({
-        id,
-        type,
-        payload
-      });
-    } catch (error) {
-      pendingRequests.delete(id);
-      reject(error);
-    }
-  });
-}
-
-async function ensureNativePort() {
-  if (nativePort) {
-    return nativePort;
-  }
-  if (!connectPromise) {
-    connectPromise = Promise.resolve().then(() => connectNativeHost());
-  }
-  return connectPromise;
-}
-
-function connectNativeHost() {
-  const port = chrome.runtime.connectNative(HOST_NAME);
-  port.onMessage.addListener(handleHostMessage);
-  port.onDisconnect.addListener(() => {
-    const reason = chrome.runtime.lastError?.message || "Native host disconnected";
-    nativePort = null;
-    connectPromise = null;
-    lastSyncedConfig = "";
-    rejectPending(reason);
-  });
-  nativePort = port;
-  return port;
-}
-
-function handleHostMessage(message) {
-  const id = message?.id;
-  if (!id || !pendingRequests.has(id)) {
-    return;
-  }
-  const { resolve } = pendingRequests.get(id);
-  pendingRequests.delete(id);
-  resolve({
-    ok: message?.ok === true,
-    data: message?.data ?? null,
-    error: message?.error || null
-  });
-}
-
-function rejectPending(reason) {
-  for (const { reject } of pendingRequests.values()) {
-    reject(new Error(reason));
-  }
-  pendingRequests.clear();
-}
-
-function normalizeOptionalPath(value) {
-  return typeof value === "string" ? value.trim() : "";
+function normalizeBackendUrl(value) {
+  return String(value).replace(/\/+$/, "");
 }

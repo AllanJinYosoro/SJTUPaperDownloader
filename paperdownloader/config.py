@@ -4,8 +4,6 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .models import ExtensionConfig
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -34,15 +32,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
-
-def apply_extension_config(settings: Settings, config: ExtensionConfig | None) -> Settings:
-    if config is None:
-        return settings
-
-    updates: dict[str, object] = {"headless": config.headless}
-    if config.download_dir:
-        updates["download_dir"] = Path(config.download_dir).expanduser()
-    if config.captcha_model_path:
-        updates["captcha_model_path"] = Path(config.captcha_model_path).expanduser()
-    return settings.model_copy(update=updates)

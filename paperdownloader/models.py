@@ -3,7 +3,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class TaskStatus(StrEnum):
@@ -43,11 +43,3 @@ class TaskSnapshot(BaseModel):
 class WorkflowResult(BaseModel):
     path: Path | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ExtensionConfig(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    headless: bool = True
-    download_dir: str | None = Field(default=None, alias="downloadDir")
-    captcha_model_path: str | None = Field(default=None, alias="captchaModelPath")

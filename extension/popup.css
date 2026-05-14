@@ -1,8 +1,8 @@
 body {
   color: #222;
-  font: 13px/1.4 "Segoe UI", Arial, sans-serif;
+  font: 13px/1.4 Arial, sans-serif;
   margin: 0;
-  width: 320px;
+  width: 300px;
 }
 
 main {
@@ -16,7 +16,7 @@ label {
   gap: 5px;
 }
 
-input[type="text"] {
+input[type="url"] {
   border: 1px solid #bbb;
   border-radius: 4px;
   box-sizing: border-box;
@@ -65,3 +65,4 @@ button#check {
 #status[data-state="success"] {
   color: #006a4e;
 }
+

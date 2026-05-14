@@ -58,7 +58,7 @@ async function startDownload(button, result, title) {
     }
   });
   if (!started?.ok) {
-    setState(button, result, "error", started?.error || "Native host unavailable");
+    setState(button, result, "error", started?.error || "Local service unavailable");
     return;
   }
   await pollTask(button, result, started.data.task_id);
