@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,17 +8,14 @@
   </head>
   <body>
     <main>
-      <label>
-        <span>Local service</span>
-        <input id="backendUrl" type="url" spellcheck="false">
-      </label>
       <label class="toggle">
-        <input id="headless" type="checkbox">
-        <span>Run browser headless</span>
+        <input id="headless" type="checkbox" aria-describedby="mode-help">
+        <span>后台运行（无头模式）</span>
       </label>
+      <p id="mode-help">取消勾选并保存，可打开可见浏览器调试。失败日志和截图保存在项目的 .debug/任务ID/ 目录。</p>
       <div class="actions">
         <button id="save" type="button">Save</button>
-        <button id="check" type="button">Check</button>
+        <button id="check" type="button">Check & Start</button>
       </div>
       <p id="status" aria-live="polite"></p>
     </main>

@@ -3,7 +3,8 @@
   "name": "SJTU Paper Downloader",
   "description": "Adds a Google Scholar button that asks a local Playwright service to download PDFs through SJTU library access.",
   "version": "0.1.0",
-  "permissions": ["storage"],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7fR//LhK3Cyd619uRvf/K9rNIpHaYsm7TLCjw2pnCfhUXGhFWtViLH64xz9xBmWkzqvc4MhzBKNuCMGkCR1Rfwwue06r3Dd06tJ1IWDY9AFIr+gV6tsbHL9m7olsUKmkqjWM6Sw5ZI87whFTjcARVeYw+uvjqt7C921AZ3nxPwBdH1ry5E56XbpA4AuSGj3BXYTo1AeITSrVJZViS1dElaZNSqQKZEpYp0ttNRuwuMIPJvjnPSGeFrwndNbb53CRb1ka+Gouqb31SsPEF0jMMHIfn7erb0bEBZXBhkbDqh2lOK3dUZUAsv5pznD3Hmgahb4oK6qqoSlR9qnxhIW2cQIDAQAB",
+  "permissions": ["storage", "nativeMessaging"],
   "host_permissions": [
     "http://127.0.0.1:*/*",
     "http://localhost:*/*"

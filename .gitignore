@@ -16,3 +16,5 @@ wheels/
 .agents/
 .playwright/
 .debug-profile/
+.debug/
+.native-host-stage/

@@ -41,7 +41,7 @@ function extractTitle(titleNode) {
   if (!titleNode) {
     return "";
   }
-  const clone = titleNode.cloneNode(true);
+  const clone = (titleNode.querySelector("a[data-clk-atid]") || titleNode.querySelector("a") || titleNode).cloneNode(true);
   for (const marker of clone.querySelectorAll(".gs_ct1, .gs_ct2")) {
     marker.remove();
   }

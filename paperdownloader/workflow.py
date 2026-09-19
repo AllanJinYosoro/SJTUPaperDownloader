@@ -1,7 +1,10 @@
 import asyncio
+import logging
+import re
+from time import monotonic
 from pathlib import Path
 from typing import Awaitable, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from playwright.async_api import (
     BrowserContext,
@@ -28,10 +31,25 @@ class ScholarDownloadWorkflow:
         settings: Settings,
         captcha_solver: JAccountCaptchaSolver,
         captcha_prompt: Callable[[bytes], Awaitable[str]] | None = None,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+        debug_dir: Path | None = None,
     ) -> None:
         self.settings = settings
         self.captcha_solver = captcha_solver
         self.captcha_prompt = captcha_prompt
+        self.progress = progress
+        self.debug_dir = debug_dir
+        self.step = "starting browser"
+        self.started = monotonic()
+        self.logger = logging.getLogger(f"{__name__}.{id(self)}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+    async def _report(self, step: str) -> None:
+        self.step = step
+        self.logger.info("%.1fs %s", monotonic() - self.started, step)
+        if self.progress is not None:
+            await self.progress(step)
 
     async def run(self, title: str, *, headless: bool | None = None) -> WorkflowResult:
         profile_dir = Path(self.settings.browser_profile_dir)
@@ -39,23 +57,58 @@ class ScholarDownloadWorkflow:
         profile_dir.mkdir(parents=True, exist_ok=True)
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        async with async_playwright() as pw:
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=self.settings.headless if headless is None else headless,
-                accept_downloads=True,
-                downloads_path=str(download_dir),
-                slow_mo=self.settings.slow_mo_ms,
-            )
-            context.set_default_timeout(self.settings.navigation_timeout_ms)
-            page = context.pages[0] if context.pages else await context.new_page()
-            try:
-                return await asyncio.wait_for(
-                    self._run_in_context(context, page, title),
-                    timeout=self.settings.task_timeout_ms / 1000,
+        handler = None
+        self.started = monotonic()
+        if self.debug_dir is not None:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(self.debug_dir / "workflow.log", encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self.logger.addHandler(handler)
+        try:
+            async with async_playwright() as pw:
+                await self._report("starting browser")
+                context = await pw.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=self.settings.headless if headless is None else headless,
+                    accept_downloads=True,
+                    downloads_path=str(download_dir),
+                    slow_mo=self.settings.slow_mo_ms,
                 )
-            finally:
-                await context.close()
+                context.set_default_timeout(self.settings.navigation_timeout_ms)
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    result = await asyncio.wait_for(
+                        self._run_in_context(context, page, title),
+                        timeout=self.settings.task_timeout_ms / 1000,
+                    )
+                    await self._report("download completed")
+                    return result
+                except Exception as exc:
+                    detail = str(exc) or f"{type(exc).__name__} after {monotonic() - self.started:.1f}s"
+                    for secret in (self.settings.jaccount_username, self.settings.jaccount_password):
+                        if secret:
+                            detail = detail.replace(secret, "[redacted]")
+                    active = context.pages[-1] if context.pages else page
+                    url = urlsplit(active.url)
+                    message = f"{self.step}: {detail}"
+                    self.logger.error("%s; page=%s://%s%s", message, url.scheme, url.netloc, url.path)
+                    if self.debug_dir is not None:
+                        try:
+                            await active.screenshot(
+                                path=str(self.debug_dir / "failure.png"),
+                                mask=[active.locator("input, textarea, [contenteditable=true]")],
+                                timeout=5_000,
+                            )
+                        except Exception as screenshot_error:
+                            self.logger.warning("Screenshot unavailable: %s", type(screenshot_error).__name__)
+                        message += f"; diagnostics: {self.debug_dir.resolve()}"
+                    raise WorkflowError(message) from exc
+                finally:
+                    await context.close()
+        finally:
+            if handler is not None:
+                self.logger.removeHandler(handler)
+                handler.close()
 
     async def _run_in_context(
         self,
@@ -63,12 +116,19 @@ class ScholarDownloadWorkflow:
         page: Page,
         title: str,
     ) -> WorkflowResult:
+        await self._report("searching SJTU library")
         await self._open_sjtu_search(page, title)
+        await self._report("matching paper title")
         await self._validate_primo_first_result(page, title)
+        await self._report("opening full-text links")
         await self._open_online_full_text(page)
+        await self._report("opening EBSCO full text")
         page = await self._open_ebsco_source(page)
+        await self._report("checking EBSCO access / jAccount login")
         await self._handle_ebsco_auth(page)
+        await self._report("opening PDF download dialog")
         download = await self._download_pdf(page)
+        await self._report("saving PDF file")
         path = await self._resolve_download_path(download)
         return WorkflowResult(
             path=path,
@@ -193,13 +253,15 @@ class ScholarDownloadWorkflow:
             except PlaywrightTimeoutError:
                 pass
             await page.wait_for_timeout(1_000)
+        raise WorkflowError("EBSCO institutional access did not complete; enable the visible debug browser to inspect the login page.")
 
     async def _maybe_select_institution(self, page: Page) -> None:
         await self._dismiss_cookie_banners(page)
         if "research.ebsco.com" in page.url and "/viewer/pdf/" in page.url:
             return
-        if await self._try_click_text(page, ["通过您的机构访问", "Access through your institution"]):
+        if await self._try_click_text(page, ["Sign in through your institution", "通过您的机构访问", "Access through your institution"]):
             await page.wait_for_load_state("domcontentloaded")
+            await self._dismiss_cookie_banners(page)
         if not await self._page_contains(page, ["Search by name", "institution", "机构"]):
             return
         box = await self._optional_first_visible(
@@ -221,24 +283,21 @@ class ScholarDownloadWorkflow:
         box: Locator,
         query: str,
     ) -> bool:
+        await self._report(f"searching institution: {query}")
         await box.fill(query)
-        await page.wait_for_timeout(800)
-        search = page.locator('button[aria-label="Search"], button[aria-label*="Search" i]').first
+        option = page.locator('[role="option"], [id^="downshift-"][id*="-item-"]').filter(
+            has_text=re.compile(
+                r"^\s*(?:上海交通大学|SHANGHAI JIAOTONG UNIV|Shanghai Jiao Tong University)(?=\s*LIBRARY\b|\s*$)",
+                re.IGNORECASE,
+            )
+        ).first
         try:
-            await search.click(timeout=5_000)
-        except Exception:
-            await box.press("Enter")
-        await page.wait_for_timeout(4_000)
-
-        for text in ["上海交通大学", "SHANGHAI JIAOTONG UNIV", "Shanghai Jiao Tong University"]:
-            try:
-                await page.get_by_text(text, exact=True).click(timeout=5_000)
-                await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(4_000)
-                return True
-            except Exception:
-                continue
-        return False
+            await option.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            return False
+        await self._report("selected Shanghai Jiao Tong University; opening login")
+        await page.wait_for_load_state("domcontentloaded")
+        return True
 
     async def _maybe_login_jaccount(self, page: Page) -> None:
         if not await self._page_contains(page, ["jAccount", "JAccount", "验证码", "captcha"]):
@@ -252,6 +311,7 @@ class ScholarDownloadWorkflow:
             raise WorkflowError("Could not find the JAccount username input.")
         if password is None:
             raise WorkflowError("Could not find the JAccount password input.")
+        await self._report("signing in with jAccount")
         await self._fill_input(username, self.settings.jaccount_username)
         await self._fill_input(password, self.settings.jaccount_password)
 
@@ -408,6 +468,7 @@ class ScholarDownloadWorkflow:
         await self._click_ebsco_toolbar_download(page)
         async with page.expect_download(timeout=45_000) as download_info:
             await self._click_ebsco_final_download(page)
+            await self._report("waiting for EBSCO PDF file")
         return await download_info.value
 
     async def _wait_for_ebsco_download_dialog(self, page: Page, timeout: int = 5_000) -> bool:
@@ -655,7 +716,10 @@ class ScholarDownloadWorkflow:
         return False
 
     async def _page_contains(self, page: Page, texts: list[str]) -> bool:
-        body = await page.locator("body").inner_text(timeout=5_000)
+        try:
+            body = await page.locator("body").inner_text(timeout=5_000)
+        except PlaywrightTimeoutError:
+            return False  # Redirects can temporarily have no document body.
         lowered = body.lower()
         return any(text.lower() in lowered for text in texts)
 

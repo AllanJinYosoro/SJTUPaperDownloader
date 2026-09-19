@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -73,13 +74,18 @@ async def submit_captcha(task_id: str, submission: CaptchaSubmission) -> TaskSna
 
 
 async def _run_task(task_id: str, request: DownloadRequest) -> None:
-    await store.update(task_id, status=TaskStatus.RUNNING, step="starting browser")
+    debug_dir = Path(".debug") / task_id
+    await store.update(
+        task_id, status=TaskStatus.RUNNING, step="starting browser",
+        metadata={"debug_dir": str(debug_dir.resolve()), "headless": request.headless},
+    )
     try:
-        await store.update(task_id, step="navigating SJTU library")
         workflow = ScholarDownloadWorkflow(
             settings,
             captcha_solver,
             captcha_prompt=lambda image_bytes: _request_human_captcha(task_id, image_bytes),
+            progress=lambda step: store.update(task_id, step=step),
+            debug_dir=debug_dir,
         )
         result = await workflow.run(request.title, headless=request.headless)
         await store.update(
@@ -87,14 +93,14 @@ async def _run_task(task_id: str, request: DownloadRequest) -> None:
             status=TaskStatus.SUCCESS,
             step="download completed",
             result_path=result.path,
-            metadata=result.metadata,
+            metadata={**result.metadata, "debug_dir": str(debug_dir.resolve())},
         )
     except Exception as exc:
         await store.update(
             task_id,
             status=TaskStatus.ERROR,
             step="failed",
-            error=str(exc),
+            error=str(exc) or type(exc).__name__,
         )
     finally:
         pending = pending_captchas.pop(task_id, None)
