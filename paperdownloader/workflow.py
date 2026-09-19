@@ -3,6 +3,7 @@ import logging
 import re
 from time import monotonic
 from pathlib import Path
+from ntpath import isreserved
 from typing import Awaitable, Callable
 from urllib.parse import quote, urlsplit
 
@@ -129,7 +130,7 @@ class ScholarDownloadWorkflow:
         await self._report("opening PDF download dialog")
         download = await self._download_pdf(page)
         await self._report("saving PDF file")
-        path = await self._resolve_download_path(download)
+        path = await self._resolve_download_path(download, title)
         return WorkflowResult(
             path=path,
             metadata={
@@ -686,9 +687,18 @@ class ScholarDownloadWorkflow:
             except Exception:
                 continue
 
-    async def _resolve_download_path(self, download: Download) -> Path | None:
-        target = Path(self.settings.download_dir).expanduser() / download.suggested_filename
-        target = self._deduplicate_path(target)
+    async def _resolve_download_path(self, download: Download, title: str) -> Path:
+        directory = Path(self.settings.download_dir).expanduser().resolve()
+        # Reserve space for the separator, .pdf, and the existing -999 suffix.
+        limit = min(200, 250 - len(str(directory).encode("utf-16-le")) // 2)
+        if limit < 5:
+            raise WorkflowError("Download directory is too long for a PDF filename.")
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title).strip()
+        name = name.encode("utf-16-le", errors="ignore")[:limit * 2].decode("utf-16-le", errors="ignore")
+        name = name.rstrip(" .") or "paper"
+        if isreserved(name + ".pdf"):
+            name = ("_" + name).encode("utf-16-le")[:limit * 2].decode("utf-16-le", errors="ignore").rstrip(" .")
+        target = self._deduplicate_path(directory / f"{name}.pdf")
         await download.save_as(str(target))
         return target
 

@@ -79,6 +79,10 @@ uv run python -m paperdownloader.cli
 - Browser automation uses a persistent profile in `.browser-profile/`, so SJTU
   and EBSCO login state can be reused.
 - Downloads are accepted into the OS default downloads directory, currently
-  `~/Downloads` unless `DOWNLOAD_DIR` is set.
+  `~/Downloads` unless `DOWNLOAD_DIR` is set. PDFs use the paper title as their
+  filename: invalid Windows characters are removed, long names are truncated
+  without splitting Unicode characters, and `.pdf` is retained. Empty names use
+  `paper.pdf`; reserved device names are prefixed with `_`. Existing files are
+  preserved with `-1`, `-2`, etc. added before `.pdf`.
 - If Primo returns no result, if the first result title is too different, or if
   ExLibris has no EBSCOhost source, the extension surfaces the service error.
