@@ -1,0 +1,13 @@
+{
+  "manifest_version": 2,
+  "name": "SJTU PDF Attachments",
+  "version": "0.2.0",
+  "description": "Import downloaded PDFs as attachments of existing Zotero items",
+  "applications": {
+    "zotero": {
+      "id": "sjtu-pdf@paperdownloader.local",
+      "strict_min_version": "9.0",
+      "strict_max_version": "9.0.*"
+    }
+  }
+}

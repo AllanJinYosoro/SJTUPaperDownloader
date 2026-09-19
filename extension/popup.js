@@ -1,44 +1,26 @@
-const DEFAULTS = {
-  backendUrl: "http://127.0.0.1:8765",
-  headless: true
-};
-
+const DEFAULTS = { backendUrl: "http://127.0.0.1:8765", headless: false, token: "" };
 const backendUrl = document.querySelector("#backendUrl");
+const token = document.querySelector("#token");
 const headless = document.querySelector("#headless");
 const status = document.querySelector("#status");
-
-document.querySelector("#save").addEventListener("click", save);
-document.querySelector("#check").addEventListener("click", check);
-
-load();
-
-async function load() {
-  const values = await chrome.storage.sync.get(DEFAULTS);
-  backendUrl.value = values.backendUrl || DEFAULTS.backendUrl;
-  headless.checked = values.headless !== false;
-}
-
+chrome.storage.local.get(DEFAULTS).then(values => {
+  backendUrl.value = values.backendUrl;
+  token.value = values.token;
+  headless.checked = values.headless;
+});
 async function save() {
-  await chrome.storage.sync.set({
-    backendUrl: backendUrl.value.replace(/\/+$/, "") || DEFAULTS.backendUrl,
-    headless: headless.checked
+  await chrome.storage.local.set({
+    backendUrl: backendUrl.value.trim() || DEFAULTS.backendUrl,
+    token: token.value.trim(), headless: headless.checked
   });
-  setStatus("success", "Saved");
+  status.textContent = "已保存";
 }
-
-async function check() {
-  await save();
-  const response = await chrome.runtime.sendMessage({ type: "health" });
-  if (!response?.ok) {
-    setStatus("error", response?.error || "Service unavailable");
-    return;
-  }
-  const model = response.data.captcha_model_available ? "model ready" : "model missing";
-  setStatus("success", `Service ready, ${model}`);
-}
-
-function setStatus(state, message) {
-  status.dataset.state = state;
-  status.textContent = message;
-}
+document.querySelector("#save").addEventListener("click", save);
+document.querySelector("#check").addEventListener("click", async () => {
+  try {
+    await save();
+    const response = await chrome.runtime.sendMessage({ type: "health" });
+    status.textContent = response?.ok ? "服务连接正常" : response?.error || "无法连接";
+  } catch (error) { status.textContent = error.message; }
+});
 

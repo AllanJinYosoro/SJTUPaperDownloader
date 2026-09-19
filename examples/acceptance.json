@@ -1,0 +1,20 @@
+[
+  {
+    "id": "acceptance-demands",
+    "type": "article-journal",
+    "title": "Demands Satiated or Not? A Psychology-Informed Deep Probabilistic Approach to Offline Store Recommendations",
+    "DOI": "10.1287/ijoc.2023.0403"
+  },
+  {
+    "id": "acceptance-social-bias",
+    "type": "article-journal",
+    "title": "Eliminating Social Popularity Bias in Recommendation: Causal Inference-Based Social Graph Neural Networks",
+    "DOI": "10.1287/ijoc.2024.0682"
+  },
+  {
+    "id": "acceptance-followee",
+    "type": "article-journal",
+    "title": "Integrating Users’ Contextual Engagements with Their General Preferences: An Interpretable Followee Recommendation Method",
+    "DOI": "10.1287/ijoc.2023.1284"
+  }
+]

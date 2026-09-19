@@ -1,677 +1,447 @@
 import asyncio
+import os
+import re
+import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Awaitable, Callable
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from uuid import uuid4
 
-from playwright.async_api import (
-    BrowserContext,
-    Download,
-    Locator,
-    Page,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
+from playwright.async_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from .captcha import CaptchaSolverError, JAccountCaptchaSolver
 from .config import Settings
-from .models import WorkflowResult
-from .textmatch import title_similarity
+from .models import DownloadRequest, WorkflowResult
+from .textmatch import normalize_title, title_similarity
+
+PRIMO = "https://86sjt-primo.hosted.exlibrisgroup.com.cn/primo-explore/search"
+SFX_HOST = "sfx-86sjtu.hosted.exlibrisgroup.com.cn"
 
 
 class WorkflowError(RuntimeError):
     pass
 
 
-class ScholarDownloadWorkflow:
-    def __init__(
-        self,
-        settings: Settings,
-        captcha_solver: JAccountCaptchaSolver,
-        captcha_prompt: Callable[[bytes], Awaitable[str]] | None = None,
-    ) -> None:
-        self.settings = settings
-        self.captcha_solver = captcha_solver
-        self.captcha_prompt = captcha_prompt
+class SourceUnavailable(WorkflowError):
+    pass
 
-    async def run(self, title: str, *, headless: bool | None = None) -> WorkflowResult:
-        profile_dir = Path(self.settings.browser_profile_dir)
-        download_dir = Path(self.settings.download_dir).expanduser()
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        download_dir.mkdir(parents=True, exist_ok=True)
 
-        async with async_playwright() as pw:
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=self.settings.headless if headless is None else headless,
-                accept_downloads=True,
-                downloads_path=str(download_dir),
-                slow_mo=self.settings.slow_mo_ms,
-            )
-            context.set_default_timeout(self.settings.navigation_timeout_ms)
-            page = context.pages[0] if context.pages else await context.new_page()
-            try:
-                return await asyncio.wait_for(
-                    self._run_in_context(context, page, title),
-                    timeout=self.settings.task_timeout_ms / 1000,
-                )
-            finally:
-                await context.close()
-
-    async def _run_in_context(
-        self,
-        context: BrowserContext,
-        page: Page,
-        title: str,
-    ) -> WorkflowResult:
-        await self._open_sjtu_search(page, title)
-        await self._validate_primo_first_result(page, title)
-        await self._open_online_full_text(page)
-        page = await self._open_ebsco_source(page)
-        await self._handle_ebsco_auth(page)
-        download = await self._download_pdf(page)
-        path = await self._resolve_download_path(download)
-        return WorkflowResult(
-            path=path,
-            metadata={
-                "final_url": page.url,
-                "suggested_filename": download.suggested_filename,
-            },
-        )
-
-    async def _open_sjtu_search(self, page: Page, title: str) -> None:
-        direct = (
-            "https://86sjt-primo.hosted.exlibrisgroup.com.cn/primo-explore/search"
-            f"?query=any,contains,{quote(title)}"
-            "&tab=paper_tab&search_scope=paper_foreign&vid=fer&offset=0"
-        )
-        await page.goto(direct, wait_until="domcontentloaded")
-
-    async def _validate_primo_first_result(self, page: Page, title: str) -> None:
-        await page.wait_for_load_state("networkidle")
-        result_title = await self._extract_first_result_title(page)
-        if not result_title:
-            raise WorkflowError("SJTU Primo returned no searchable result title.")
-        score = title_similarity(title, result_title)
-        if score < self.settings.title_match_threshold:
-            raise WorkflowError(
-                f"First result title does not match target. Expected '{title}', "
-                f"got '{result_title}' (score={score:.2f})."
-            )
-
-    async def _extract_first_result_title(self, page: Page) -> str | None:
-        selectors = [
-            "prm-brief-result .item-title",
-            ".item-title",
-            "h3",
-            "a[title]",
-        ]
-        for selector in selectors:
-            locator = page.locator(selector).first
-            try:
-                text = (await locator.inner_text(timeout=4_000)).strip()
-            except PlaywrightTimeoutError:
-                continue
-            if text:
-                return text
-        return await page.evaluate(
-            """() => {
-                const candidates = [...document.querySelectorAll('a, h3, .item-title')];
-                const el = candidates.find(node => node.textContent.trim().length > 8);
-                return el ? el.textContent.trim() : null;
-            }"""
-        )
-
-    async def _open_online_full_text(self, page: Page) -> None:
-        if "/search?" in page.url:
-            full_display_url = await page.evaluate(
-                """() => {
-                    const result = document.querySelector('prm-brief-result');
-                    const links = result ? [...result.querySelectorAll('a[href*="fulldisplay"]')] : [];
-                    const titleLink = links.find(a => (a.textContent || '').trim().length > 5);
-                    return titleLink ? titleLink.href : (links[0] ? links[0].href : null);
-                }"""
-            )
-            if not full_display_url:
-                raise WorkflowError("Could not find the first Primo full-display link.")
-            await page.goto(full_display_url, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle")
-            try:
-                await page.locator(
-                    'a[href*="sfx-86sjtu.hosted.exlibrisgroup.com.cn"]'
-                ).first.wait_for(timeout=20_000)
-            except PlaywrightTimeoutError:
-                pass
-
-        sfx_url = await page.evaluate(
-            """() => {
-                const links = [...document.querySelectorAll('a[href*="sfx-86sjtu.hosted.exlibrisgroup.com.cn"]')];
-                const fullText = links.find(a => /在线资源|更多选项|full/i.test(a.textContent || a.getAttribute('aria-label') || ''));
-                return fullText ? fullText.href : (links[0] ? links[0].href : null);
-            }"""
-        )
-        if sfx_url:
-            await page.goto(sfx_url, wait_until="domcontentloaded")
-            return
-
-        if await self._try_click_text(page, ["在线全文", "Online Access", "Full text available"]):
-            await page.wait_for_load_state("domcontentloaded")
-            return
-        raise WorkflowError("Could not find the Primo full-text service link.")
-
-    async def _open_ebsco_source(self, page: Page) -> Page:
-        await page.wait_for_load_state("networkidle")
-        row_id = await page.evaluate(
-            """() => {
-                const row = [...document.querySelectorAll('tr[id^="tr_"]')]
-                    .find(tr => /EBSCOhost/i.test(tr.textContent || ''));
-                return row ? row.id : null;
-            }"""
-        )
-        if not row_id:
-            raise WorkflowError("No EBSCOhost full-text source was available.")
-        link = page.locator(f"tr#{row_id} a").filter(has_text="Full text available via").first
-
+@contextmanager
+def profile_lock(directory: Path):
+    """OS lock released on process exit, including crashes (Windows and Linux)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "downloader.lock").open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if not handle.tell():
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
         try:
-            async with page.context.expect_page(timeout=15_000) as popup_info:
-                await link.click(timeout=10_000)
-            ebsco_page = await popup_info.value
-            await ebsco_page.wait_for_load_state("domcontentloaded")
-            return ebsco_page
-        except PlaywrightTimeoutError:
-            await link.click(timeout=10_000)
-            await page.wait_for_load_state("domcontentloaded")
-            return page
-
-    async def _handle_ebsco_auth(self, page: Page) -> None:
-        for _ in range(8):
-            if "research.ebsco.com" in page.url and "/viewer/pdf/" in page.url:
-                return
-            await self._maybe_select_institution(page)
-            await self._maybe_login_jaccount(page)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except PlaywrightTimeoutError:
-                pass
-            await page.wait_for_timeout(1_000)
-
-    async def _maybe_select_institution(self, page: Page) -> None:
-        await self._dismiss_cookie_banners(page)
-        if "research.ebsco.com" in page.url and "/viewer/pdf/" in page.url:
-            return
-        if await self._try_click_text(page, ["通过您的机构访问", "Access through your institution"]):
-            await page.wait_for_load_state("domcontentloaded")
-        if not await self._page_contains(page, ["Search by name", "institution", "机构"]):
-            return
-        box = await self._optional_first_visible(
-            page.locator(
-                '#fmo_input_type_field_id, input[aria-label*="organization" i], '
-                'input[aria-label*="institution" i], input[type="search"], input[type="text"]'
-            )
-        )
-        if box is None:
-            return
-        if await self._search_and_select_institution(page, box, "上海交通大学"):
-            return
-        if await self._search_and_select_institution(page, box, "Shanghai Jiao Tong University"):
-            return
-
-    async def _search_and_select_institution(
-        self,
-        page: Page,
-        box: Locator,
-        query: str,
-    ) -> bool:
-        await box.fill(query)
-        await page.wait_for_timeout(800)
-        search = page.locator('button[aria-label="Search"], button[aria-label*="Search" i]').first
-        try:
-            await search.click(timeout=5_000)
-        except Exception:
-            await box.press("Enter")
-        await page.wait_for_timeout(4_000)
-
-        for text in ["上海交通大学", "SHANGHAI JIAOTONG UNIV", "Shanghai Jiao Tong University"]:
-            try:
-                await page.get_by_text(text, exact=True).click(timeout=5_000)
-                await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(4_000)
-                return True
-            except Exception:
-                continue
-        return False
-
-    async def _maybe_login_jaccount(self, page: Page) -> None:
-        if not await self._page_contains(page, ["jAccount", "JAccount", "验证码", "captcha"]):
-            return
-        if not self.settings.jaccount_username or not self.settings.jaccount_password:
-            raise WorkflowError("JAccount credentials are missing in .env.")
-
-        username = await self._find_jaccount_username_input(page)
-        password = await self._find_jaccount_password_input(page)
-        if username is None:
-            raise WorkflowError("Could not find the JAccount username input.")
-        if password is None:
-            raise WorkflowError("Could not find the JAccount password input.")
-        await self._fill_input(username, self.settings.jaccount_username)
-        await self._fill_input(password, self.settings.jaccount_password)
-
-        for _ in range(self.settings.captcha_max_retries):
-            captcha_input = await self._find_jaccount_captcha_input(page)
-            if captcha_input is not None:
-                try:
-                    image_bytes = await self._screenshot_jaccount_captcha(page, captcha_input)
-                    self._save_debug_captcha(image_bytes)
-                    prediction = self.captcha_solver.solve(image_bytes)
-                    if len(prediction) < 4:
-                        if self.captcha_prompt is None:
-                            raise WorkflowError(
-                                f"Captcha recognition returned too few characters: {prediction!r}. "
-                                "This indicates a recognition/crop issue, not an input issue. "
-                                f"{self.captcha_solver.last_diagnostics}. "
-                                "Saved the exact captcha image sent to ONNX at "
-                                ".debug/jaccount-captcha-last.png."
-                            )
-                        prediction = await self.captcha_prompt(image_bytes)
-                    await self._fill_input(captcha_input, prediction)
-                    actual = await captcha_input.input_value()
-                    if actual != prediction:
-                        raise WorkflowError(
-                            f"Captcha input mismatch after fill. Recognized {prediction!r}, "
-                            f"but the page field contains {actual!r}. This indicates an input-field issue."
-                        )
-                except CaptchaSolverError as exc:
-                    raise WorkflowError(str(exc)) from exc
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                raise WorkflowError("Could not find the JAccount captcha input.")
-            if await self._submit_jaccount_login(page, password):
-                return
-            if self.captcha_prompt is not None:
-                captcha_input = await self._find_jaccount_captcha_input(page)
-                if captcha_input is None:
-                    raise WorkflowError("Could not find the JAccount captcha input after failed captcha.")
-                image_bytes = await self._screenshot_jaccount_captcha(page, captcha_input)
-                self._save_debug_captcha(image_bytes)
-                human_text = await self.captcha_prompt(image_bytes)
-                await self._fill_input(captcha_input, human_text)
-                actual = await captcha_input.input_value()
-                if actual != human_text:
-                    raise WorkflowError(
-                        f"Captcha input mismatch after human fill. Expected {human_text!r}, "
-                        f"but the page field contains {actual!r}."
-                    )
-                if await self._submit_jaccount_login(page, password):
-                    return
-        raise WorkflowError("JAccount login failed after captcha retries.")
-
-    async def _submit_jaccount_login(self, page: Page, password: Locator) -> bool:
-        if not await self._try_click_text(page, ["登录", "Login", "Sign in"]):
-            await password.press("Enter")
-        await page.wait_for_timeout(2_000)
-        return not await self._page_contains(page, ["验证码错误", "captcha incorrect"])
-
-    async def _find_jaccount_username_input(self, page: Page) -> Locator | None:
-        return await self._optional_first_visible(
-            page.locator(
-                'input[placeholder*="用户名"], input[placeholder*="账号"], '
-                'input[placeholder*="jAccount" i], input[name*="user" i], '
-                'input[id*="user" i], input[name*="account" i], input[id*="account" i]'
-            )
-        )
-
-    async def _fill_input(self, locator: Locator, value: str) -> None:
-        await locator.fill(value)
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise WorkflowError("浏览器正被另一个下载进程使用，请等待它完成。") from exc
         try:
-            if await locator.input_value(timeout=2_000) == value:
-                return
-        except Exception:
-            pass
-        await locator.evaluate(
-            """(element, text) => {
-                const prototype = Object.getPrototypeOf(element);
-                const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
-                if (descriptor && descriptor.set) {
-                    descriptor.set.call(element, text);
-                } else {
-                    element.value = text;
-                }
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
-            }""",
-            value,
-        )
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
-    async def _find_jaccount_password_input(self, page: Page) -> Locator | None:
-        return await self._optional_first_visible(
-            page.locator('input[type="password"], input[placeholder*="密码"]')
-        )
 
-    async def _find_jaccount_captcha_input(self, page: Page) -> Locator | None:
-        captcha = await self._optional_first_visible(
-            page.locator(
-                'input[placeholder*="验证码"], input[name*="captcha" i], '
-                'input[id*="captcha" i], input[name*="vcode" i], input[id*="vcode" i]'
-            )
-        )
-        if captcha is not None:
-            return captcha
-
-        text_inputs = page.locator('input[type="text"], input:not([type])')
-        count = await text_inputs.count()
-        visible: list[Locator] = []
-        for index in range(min(count, 12)):
-            item = text_inputs.nth(index)
-            try:
-                if await item.is_visible(timeout=1_000):
-                    visible.append(item)
-            except Exception:
-                continue
-        if len(visible) >= 2:
-            return visible[-1]
-        return None
-
-    async def _screenshot_jaccount_captcha(self, page: Page, captcha_input: Locator) -> bytes:
-        captcha_image = await self._optional_first_visible(
-            page.locator(
-                'img[src*="captcha" i], img[id*="captcha" i], img[name*="captcha" i], '
-                'img[alt*="验证码"], img[alt*="captcha" i]'
-            )
-        )
-        if captcha_image is not None:
-            return await captcha_image.screenshot()
-
-        box = await captcha_input.bounding_box()
-        if box is None:
-            raise WorkflowError("Could not locate the JAccount captcha area.")
-        clip_x = box["x"] + box["width"] * 0.45
-        clip_width = box["width"] * 0.52
-        return await page.screenshot(
-            clip={
-                "x": clip_x,
-                "y": box["y"],
-                "width": clip_width,
-                "height": box["height"],
-            }
-        )
-
-    def _save_debug_captcha(self, image_bytes: bytes) -> None:
-        debug_dir = Path(".debug")
-        debug_dir.mkdir(exist_ok=True)
-        (debug_dir / "jaccount-captcha-last.png").write_bytes(image_bytes)
-
-    async def _download_pdf(self, page: Page) -> Download:
-        await self._dismiss_cookie_banners(page)
-        for _ in range(20):
-            if "research.ebsco.com" in page.url:
-                break
-            await page.wait_for_timeout(1_000)
-
-        await self._click_ebsco_toolbar_download(page)
-        async with page.expect_download(timeout=45_000) as download_info:
-            await self._click_ebsco_final_download(page)
-        return await download_info.value
-
-    async def _wait_for_ebsco_download_dialog(self, page: Page, timeout: int = 5_000) -> bool:
-        for selector in [
-            'div[role="dialog"]',
-            '[data-auto="bulk-download-modal-download-button"]',
-            'text="选择格式"',
-            'text="PDF（推荐台式计算机使用）"',
-            'text="Select a format"',
-            'text="PDF"',
-        ]:
-            try:
-                await page.locator(selector).first.wait_for(state="visible", timeout=timeout)
-                return True
-            except Exception:
-                continue
+def is_pdf(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            if handle.read(5) != b"%PDF-":
+                return False
+            handle.seek(max(0, path.stat().st_size - 2048))
+            return b"%%EOF" in handle.read()
+    except OSError:
         return False
 
-    async def _click_ebsco_final_download(self, page: Page) -> None:
-        selectors = [
-            '[data-auto="bulk-download-modal-download-button"]',
-            'div[role="dialog"] button[title="Download"]',
-            'div[role="dialog"] button[title="下载"]',
-            'div[role="dialog"] button[aria-label="Download"]',
-            'div[role="dialog"] button[aria-label="下载"]',
-            'div[role="dialog"] button.nuc-bulk-download-modal-footer__button:has-text("Download")',
-            'div[role="dialog"] button:has-text("Download")',
-            'div[role="dialog"] button:has-text("下载")',
-            'button.nuc-bulk-download-modal-footer__button:has-text("Download")',
-            'button.nuc-bulk-download-modal-footer__button:has-text("下载")',
-            'button:has-text("Download")',
-            'button:has-text("下载")',
-            'a[download]',
-            'a[href*="download" i]',
-        ]
-        for selector in selectors:
-            locator = page.locator(selector).last
-            try:
-                await locator.wait_for(state="visible", timeout=2_500)
-                await locator.click(timeout=3_000)
-                return
-            except Exception:
-                continue
 
-        clicked = await page.evaluate(
-            """() => {
-                const visible = el => {
-                    const rect = el.getBoundingClientRect();
-                    const style = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none';
-                };
-                const dialogs = [...document.querySelectorAll('[role="dialog"], .eb-modal, body')];
-                for (const root of dialogs) {
-                    const buttons = [...root.querySelectorAll('button, [role="button"], a')]
-                        .filter(visible)
-                        .filter(el => /^(下载|Download)$/i.test((el.textContent || '').trim()) ||
-                            /^(下载|Download)$/i.test(el.getAttribute('aria-label') || '') ||
-                            /^(下载|Download)$/i.test(el.getAttribute('title') || ''));
-                    if (buttons.length) {
-                        buttons[buttons.length - 1].click();
-                        return true;
-                    }
-                }
-                const modal = [...document.querySelectorAll('[role="dialog"], .eb-modal, [class*="modal" i]')]
-                    .filter(visible)
-                    .sort((a, b) => b.getBoundingClientRect().width * b.getBoundingClientRect().height -
-                        a.getBoundingClientRect().width * a.getBoundingClientRect().height)[0];
-                if (!modal) {
-                    return false;
-                }
-                const candidates = [...modal.querySelectorAll('button, [role="button"], a')]
-                    .filter(visible)
-                    .sort((a, b) => {
-                        const ar = a.getBoundingClientRect();
-                        const br = b.getBoundingClientRect();
-                        return (br.bottom + br.right) - (ar.bottom + ar.right);
-                    });
-                if (!candidates.length) {
-                    return false;
-                }
-                candidates[0].click();
-                return true;
-            }"""
-        )
-        if clicked:
-            return
+async def click_new_page(page: Page, locator) -> Page:
+    """Click once, whether the link navigates in-place or opens a popup."""
+    before = page.url
+    popup = asyncio.create_task(page.wait_for_event("popup", timeout=45_000))
+    navigation = asyncio.create_task(page.wait_for_url(
+        lambda url: url != before, wait_until="domcontentloaded", timeout=45_000))
+    try:
+        await asyncio.sleep(0)
+        await locator.click()
+        done, _ = await asyncio.wait([popup, navigation], return_when=asyncio.FIRST_COMPLETED)
+        if popup in done:
+            result = popup.result()
+        else:
+            navigation.result()
+            result = page
+        await result.wait_for_load_state("domcontentloaded")
+        return result
+    finally:
+        for task in (popup, navigation):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(popup, navigation, return_exceptions=True)
 
-        diagnostic = await page.evaluate(
-            """() => [...document.querySelectorAll('button, a, [role="button"]')]
-                .map((el, index) => ({
-                    index,
-                    tag: el.tagName,
-                    text: (el.textContent || '').trim().slice(0, 80),
-                    aria: el.getAttribute('aria-label') || '',
-                    title: el.getAttribute('title') || '',
-                    cls: String(el.className || '').slice(0, 120)
-                }))
-                .filter(item => /download|下载|pdf/i.test(
-                    item.text + item.aria + item.title + item.cls
-                ))
-                .slice(0, 20)"""
-        )
-        raise WorkflowError(f"Could not find the EBSCO final download button. Candidates: {diagnostic}")
 
-    async def _click_ebsco_toolbar_download(self, page: Page) -> None:
-        selectors = [
-            'button[data-auto="tool-button"].tools-menu__tool--download__button',
-            '.tools-menu__tool--download button[data-auto="tool-button"]',
-            'button.tools-menu__tool--download__button',
-            'button.tools-menu__tool--download__button[aria-label="Download"]',
-            'button.tools-menu__tool--download__button[aria-label="下载"]',
-            'button[aria-label="Download"] svg[data-icon="download"]',
-            'button[aria-label="下载"] svg[data-icon="download"]',
-            'button:has(svg[data-icon="download"])',
-        ]
-        for selector in selectors:
-            locator = page.locator(selector).first
-            try:
-                await locator.wait_for(state="visible", timeout=8_000)
-                button = locator.locator("xpath=ancestor-or-self::button[1]").first
-                if await button.count() > 0:
-                    locator = button
-                await locator.click(timeout=5_000)
-                if await self._wait_for_ebsco_download_dialog(page, timeout=2_000):
-                    return
-            except Exception:
-                continue
+class ScholarDownloadWorkflow:
+    def __init__(self, settings: Settings, progress: Callable[[str], Awaitable[None]] | None = None):
+        self.settings = settings
+        self.progress = progress
+        self.step = "starting"
 
-            try:
-                await locator.evaluate(
-                    """element => {
-                        const button = element.closest('button') || element;
-                        button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-                        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                        button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
-                        button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                        button.click();
-                    }"""
+    async def report(self, step: str):
+        self.step = step
+        if self.progress:
+            await self.progress(step)
+
+    async def run(self, title: str, *, doi: str = "", headless: bool | None = None) -> WorkflowResult:
+        request = DownloadRequest(title=title, doi=doi)
+        visible = not (self.settings.headless if headless is None else headless)
+        profile = self.settings.browser_profile_dir.expanduser().resolve()
+        output = self.settings.download_dir.expanduser().resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        with profile_lock(profile):
+            async with async_playwright() as pw:
+                context = await pw.chromium.launch_persistent_context(
+                    str(profile), headless=not visible, accept_downloads=True,
                 )
-                if await self._wait_for_ebsco_download_dialog(page, timeout=2_000):
-                    return
-            except Exception:
-                continue
+                context.set_default_timeout(self.settings.navigation_timeout_ms)
+                state_path = profile / "auth-state.json"
+                if state_path.is_file():
+                    try:
+                        saved = json.loads(state_path.read_text(encoding="utf-8"))
+                        await context.add_cookies(saved["cookies"])
+                    except (ValueError, KeyError):
+                        pass
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    return await self._run_sources(page, request, visible, output)
+                except TimeoutError as exc:
+                    raise WorkflowError(f"超时（{self.step}）。若正在登录，请以可见模式重试。") from exc
+                finally:
+                    try:
+                        state = await context.storage_state()
+                        temporary = state_path.with_suffix(".tmp")
+                        with temporary.open("w", encoding="utf-8") as file:
+                            temporary.chmod(0o600)
+                            json.dump(state, file)
+                        temporary.replace(state_path)
+                    finally:
+                        await context.close()
 
-        # EBSCO sometimes renders the toolbar icon without accessible labels.
-        # Click the visible top toolbar button whose center is nearest the
-        # screenshot position of the download icon.
-        clicked = await page.evaluate(
-            """() => {
-                const candidates = [...document.querySelectorAll('button, [role="button"], a')]
-                    .map(el => {
-                        const rect = el.getBoundingClientRect();
-                        return { el, rect };
-                    })
-                    .filter(({ rect }) =>
-                        rect.width >= 24 &&
-                        rect.height >= 24 &&
-                        rect.top >= 0 &&
-                        rect.top <= 90 &&
-                        rect.left > window.innerWidth * 0.55
-                    )
-                    .sort((a, b) => {
-                        const ax = a.rect.left + a.rect.width / 2;
-                        const bx = b.rect.left + b.rect.width / 2;
-                        const ay = a.rect.top + a.rect.height / 2;
-                        const by = b.rect.top + b.rect.height / 2;
-                        const targetX = window.innerWidth * 0.83;
-                        const targetY = 34;
-                        return Math.hypot(ax - targetX, ay - targetY) -
-                            Math.hypot(bx - targetX, by - targetY);
-                    });
-                if (!candidates.length) {
-                    return false;
-                }
-                candidates[0].el.click();
-                return true;
-            }"""
-        )
-        if clicked and await self._wait_for_ebsco_download_dialog(page, timeout=3_000):
-            return
-
-        diagnostic = await page.evaluate(
-            """() => [...document.querySelectorAll('button, a, [role="button"]')]
-                .map((el, index) => {
-                    const rect = el.getBoundingClientRect();
-                    return {
-                        index,
-                        tag: el.tagName,
-                        text: (el.textContent || '').trim().slice(0, 80),
-                        aria: el.getAttribute('aria-label') || '',
-                        title: el.getAttribute('title') || '',
-                        dataAuto: el.getAttribute('data-auto') || '',
-                        cls: String(el.className || '').slice(0, 120),
-                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-                    };
-                })
-                .filter(item => /download|下载|tool-button/i.test(
-                    item.text + item.aria + item.title + item.dataAuto + item.cls
-                ))
-                .slice(0, 30)"""
-        )
-        raise WorkflowError(
-            "EBSCO download dialog did not appear after clicking the toolbar download button. "
-            f"Toolbar candidates: {diagnostic}"
-        )
-
-    async def _dismiss_cookie_banners(self, page: Page) -> None:
-        for text in ["Accept All", "Reject All", "接受全部", "全部接受"]:
+    async def _run_sources(self, page, request, visible, output):
+        from .fallbacks import download_scihub, download_ssrn
+        attempts = []
+        for name, handler in (("SJTU", self._run), ("Sci-Hub", download_scihub), ("SSRN", download_ssrn)):
+            await self.report(f"检索来源：{name}")
+            context = None
             try:
-                await page.get_by_text(text, exact=False).first.click(timeout=2_000)
-                await page.wait_for_timeout(500)
+                # Each source gets its own deadline; a stuck library must not
+                # consume the time available to both fallback sources.
+                async with asyncio.timeout(self.settings.task_timeout_ms / 1000):
+                    if name == "SJTU":
+                        result = await handler(page, request, visible, output)
+                    else:
+                        # Never share university cookies or saved credentials with fallbacks.
+                        context = await page.context.browser.new_context(accept_downloads=True)
+                        context.set_default_timeout(self.settings.navigation_timeout_ms)
+                        external = await context.new_page()
+                        result = await handler(external, request, output,
+                                               self.settings.model_copy(update={"headless": not visible}), self.report)
+                    result.metadata.update(provider=name, attempts=attempts + [{"source": name, "status": "success"}])
+                    if request.doi:
+                        result.metadata.setdefault("resolved_doi", request.doi)
+                    return result
+            except (WorkflowError, PlaywrightError, TimeoutError) as exc:
+                reason = str(exc) if isinstance(exc, WorkflowError) else (
+                    "来源超时" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "浏览器访问失败")
+                attempts.append({"source": name, "status": "unavailable", "reason": reason})
+                await self.report(f"{name} 未能下载：{reason}")
+            finally:
+                if context:
+                    await context.close()
+        raise WorkflowError("所有来源均未能下载：" + "; ".join(f"{a['source']}: {a['reason']}" for a in attempts))
+
+    async def _run(self, page: Page, request: DownloadRequest, visible: bool, output: Path):
+        await self.report("检索交大图书馆")
+        # ponytail: inspect first 10 results; add pagination if real misses require it.
+        query = request.doi or request.title
+        await page.goto(PRIMO + f"?query=any,contains,{quote(query, safe='')}"
+                        "&tab=paper_tab&search_scope=paper_foreign&vid=fer&offset=0",
+                        wait_until="domcontentloaded")
+        rows = page.locator("prm-brief-result:visible")
+        previous, stable = [], 0
+        deadline = asyncio.get_running_loop().time() + self.settings.navigation_timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            records = await rows.evaluate_all("""nodes => nodes.map(node => ({
+                title: node.querySelector('.item-title')?.textContent.trim(),
+                href: node.querySelector('a[href*="fulldisplay"]')?.href
+            })).filter(row => row.title && row.href)""")
+            # Angular hydrates each result asynchronously. Read title + link together,
+            # after the result set settles; don't mix two versions of the DOM.
+            stable = stable + 1 if records and records == previous else 0
+            previous = records
+            if stable >= 2:
+                break
+            await asyncio.sleep(0.5)
+        if not previous:
+            raise WorkflowError("图书馆未返回有效检索结果，或检索服务未能加载。")
+        records = list({record["href"]: record for record in previous}.values())[:10]
+        candidates = [record["title"] for record in records]
+        scores = [title_similarity(request.title, t) for t in candidates[:10]]
+        index = max(range(len(scores)), key=scores.__getitem__)
+        if scores[index] < self.settings.title_match_threshold:
+            raise WorkflowError(f"未找到足够匹配的标题：{candidates[index]} ({scores[index]:.2f})")
+        if sum(s >= self.settings.title_match_threshold for s in scores) > 1:
+            matches = [t for t, s in zip(candidates, scores) if s >= self.settings.title_match_threshold]
+            raise WorkflowError(f"有多个相近检索结果，请在图书馆确认版本：{matches}")
+        await page.goto(records[index]["href"], wait_until="domcontentloaded")
+        sfx = page.locator(f'a[href*="{SFX_HOST}"]').first
+        await sfx.wait_for()
+        sfx_url = await sfx.get_attribute("href") or ""
+        identifiers = parse_qs(urlsplit(sfx_url).query).get("rft_id", [])
+        dois = [value[9:].lower() for value in identifiers if value.lower().startswith("info:doi/")]
+        if request.doi and dois and request.doi not in dois:
+            raise WorkflowError(f"图书馆详情 DOI 与目标不一致：{dois}")
+        if not request.doi and len(dois) == 1:
+            request.doi = dois[0]
+        page = await click_new_page(page, sfx)
+        await self.report("选择 EBSCO 全文来源")
+        rows = page.locator('tr[id^="tr_"]').filter(has_text=re.compile("EBSCOhost", re.I))
+        try:
+            await rows.first.wait_for(timeout=15_000)
+        except PlaywrightTimeoutError as exc:
+            raise WorkflowError("该文献未提供 EBSCOhost 全文来源；当前版本只支持此下载通道。") from exc
+        source_page, source_url = page, page.url
+        names = await rows.all_inner_texts()
+        order = sorted(range(len(names)), key=lambda i: "Business Source Complete" not in names[i])
+        errors = []
+        for source_index in order:
+            name = next((line.strip() for line in names[source_index].splitlines() if "EBSCOhost" in line), "EBSCOhost")
+            await self.report(f"尝试来源：{name}")
+            source = rows.nth(source_index).locator("a").filter(has_text=re.compile("Full text available via", re.I)).first
+            article = await click_new_page(source_page, source)
+            try:
+                await self._authenticate(article, visible)
+                article = await self._open_ebsco_pdf(article, request)
+                result = await self._download_pdf(article, output)
+                result.metadata.update(matched_title=candidates[index], title_score=scores[index], source=name)
+                return result
+            except SourceUnavailable as exc:
+                errors.append(f"{name}: {exc}")
+                await self.report(str(exc))
+                if article is source_page:
+                    await source_page.goto(source_url, wait_until="domcontentloaded")
+                else:
+                    await article.close()
+        raise WorkflowError("所有 EBSCO 来源均不可用：" + "; ".join(errors))
+
+    async def _open_ebsco_pdf(self, page: Page, request: DownloadRequest) -> Page:
+        if "/viewer/pdf/" in page.url:
+            return page
+        await self.report("在 EBSCO 中校验目标论文")
+        accept = page.get_by_role("button", name="Accept All", exact=True).first
+        if await accept.is_visible():
+            await accept.click()
+        if "/search/results" in page.url:
+            box = page.locator("#search-input")
+            await box.wait_for()
+            queries = ([f'"{request.doi}"'] if request.doi else []) + [f'"{normalize_title(request.title)}"']
+            matched = None
+            for query in queries:
+                await box.fill(query)
+                async with page.expect_response(
+                        lambda response: urlsplit(response.url).path == "/api/search/v1/search") as response:
+                    await box.press("Enter")
+                result = await response.value
+                await result.finished()
+                if not result.ok:
+                    raise SourceUnavailable(f"EBSCO 检索返回 HTTP {result.status}")
+                await page.wait_for_function("""() =>
+                    document.querySelector('[data-auto="result-item-title__link"]') ||
+                    /No results for|未找到|没有找到/.test(document.querySelector('main')?.innerText || '')""")
+                links = page.locator('[data-auto="result-item-title__link"]')
+                entries = await links.evaluate_all("nodes => nodes.map(n => ({title:n.textContent.trim(),href:n.href}))")
+                matches = [entry for entry in entries if title_similarity(request.title, entry["title"]) >= self.settings.title_match_threshold]
+                if len(matches) == 1:
+                    matched = matches[0]
+                    break
+                if len(matches) > 1:
+                    raise SourceUnavailable("EBSCO 返回多个相近条目，不能唯一定位")
+            if not matched:
+                raise SourceUnavailable("该数据库未找到匹配的论文")
+            await page.goto(matched["href"], wait_until="domcontentloaded")
+        access = page.get_by_role("button", name=re.compile(r"Access options|访问选项", re.I)).first
+        await access.wait_for()
+        await access.click()
+        pdf = page.locator('a[href*="/viewer/pdf/"], [role="menuitem"][data-auto="menuitem-PDF"]').first
+        try:
+            await pdf.wait_for(timeout=8000)
+        except PlaywrightTimeoutError as exc:
+            raise SourceUnavailable("该条目未提供可下载的 PDF 全文") from exc
+        return await click_new_page(page, pdf)
+
+    async def _download_pdf(self, page: Page, output: Path) -> WorkflowResult:
+        await self.report("下载 PDF")
+        # Subscribe before toolbar click: some versions download without a dialog.
+        future = asyncio.get_running_loop().create_future()
+
+        def on_download(download):
+            if not future.done():
+                future.set_result(download)
+
+        page.on("download", on_download)
+        try:
+            toolbar = page.locator(
+                'button.tools-menu__tool--download__button, '
+                '.tools-menu__tool--download button, button:has(svg[data-icon="download"])'
+            ).first
+            await toolbar.click()
+            final = page.locator(
+                '[data-auto="bulk-download-modal-download-button"], '
+                '[role="dialog"] button[title="Download"], '
+                '[role="dialog"] button[title="下载"], '
+                '[role="dialog"] button:has-text("Download"), '
+                '[role="dialog"] button:has-text("下载")'
+            ).last
+            for _ in range(60):
+                if future.done():
+                    break
+                if await final.is_visible():
+                    await final.click()
+                    break
+                await asyncio.sleep(0.5)
+            download = await asyncio.wait_for(future, timeout=60)
+            path = output / f"{uuid4().hex}.pdf"
+            temp = path.with_suffix(".part")
+            try:
+                await download.save_as(temp)
+                if not is_pdf(temp):
+                    raise WorkflowError("下载内容不是完整 PDF（可能为登录页或错误页面）")
+                temp.replace(path)
+            finally:
+                temp.unlink(missing_ok=True)
+            return WorkflowResult(path=path, metadata={
+                "final_url": page.url, "suggested_filename": download.suggested_filename,
+            })
+        finally:
+            page.remove_listener("download", on_download)
+            if not future.done():
+                future.cancel()
+
+    async def _authenticate(self, page: Page, visible: bool):
+        await self.report("等待机构认证；如出现 jAccount，请在浏览器完成登录")
+        institution_chosen = False
+        login_attempted = False
+        last_host = None
+        while True:
+            host = urlsplit(page.url).hostname or ""
+            if host and host != last_host:
+                await self.report(f"机构认证：{host}（如出现登录页，请在浏览器完成登录）")
+                last_host = host
+            if host == "research.ebsco.com" and any(
+                    part in page.url for part in ("/viewer/pdf/", "/search/results", "/search/details/")):
                 return
-            except Exception:
+            if host == "jaccount.sjtu.edu.cn":
+                if not login_attempted:
+                    await self._login_jaccount(page, visible)
+                    login_attempted = True
+                if not visible:
+                    if urlsplit(page.url).hostname == host:
+                        raise WorkflowError("jAccount 尚未登录，请配置账号和验证码组件或使用可见浏览器。")
+                await asyncio.sleep(1)
                 continue
+            for label in ("Accept All", "Reject All", "接受全部", "全部接受"):
+                cookie = page.get_by_role("button", name=label, exact=True).first
+                if await cookie.is_visible():
+                    await cookie.click()
+                    break
+            access = page.get_by_text(re.compile("通过您的机构访问|通过.*机构登录|(?:Access|Sign in) through your institution", re.I)).first
+            if await access.is_visible():
+                await access.click()
+            box = page.locator('#fmo_input_type_field_id, input[aria-label*="institution" i], '
+                               'input[aria-label*="organization" i]').first
+            if not institution_chosen and await box.is_visible():
+                await self.report("在 EBSCO 搜索上海交通大学")
+                await box.fill("Shanghai Jiao Tong University")
+                search = page.get_by_role("button", name="Search", exact=True).first
+                if await search.is_visible():
+                    await search.click()
+                else:
+                    await box.press("Enter")
+                choice = page.get_by_text(re.compile(
+                    r"^(上海交通大学|SHANGHAI JIAOTONG UNIV|Shanghai Jiao Tong University)$", re.I)).first
+                await choice.click()
+                await self.report("已选择上海交通大学，等待认证跳转")
+                institution_chosen = True
+            pdf_link = page.locator('a[href*="/viewer/pdf/"]').first
+            if await pdf_link.is_visible():
+                href = await pdf_link.get_attribute("href")
+                await page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
+            await asyncio.sleep(1)
 
-    async def _resolve_download_path(self, download: Download) -> Path | None:
-        target = Path(self.settings.download_dir).expanduser() / download.suggested_filename
-        target = self._deduplicate_path(target)
-        await download.save_as(str(target))
-        return target
-
-    def _deduplicate_path(self, path: Path) -> Path:
-        if not path.exists():
-            return path
-        stem = path.stem
-        suffix = path.suffix
-        for index in range(1, 1000):
-            candidate = path.with_name(f"{stem}-{index}{suffix}")
-            if not candidate.exists():
-                return candidate
-        raise WorkflowError(f"Could not choose a unique download path for {path}.")
-
-    async def _try_click_text(self, page: Page, texts: list[str]) -> bool:
-        for text in texts:
-            locator = page.get_by_text(text, exact=False).first
+    async def _login_jaccount(self, page: Page, visible: bool):
+        parsed = urlsplit(page.url)
+        if parsed.scheme != "https" or parsed.hostname != "jaccount.sjtu.edu.cn":
+            raise WorkflowError("拒绝向非官方 jAccount 页面填写账号密码")
+        username = self.settings.jaccount_username
+        password = self.settings.jaccount_password
+        if not username or not password or not username.get_secret_value() or not password.get_secret_value():
+            if not visible:
+                raise WorkflowError("请在 .env 填写 JACCOUNT_USERNAME / JACCOUNT_PASSWORD，或使用可见浏览器登录")
+            return
+        account = page.locator('#input-login-user, input[name="user"]').first
+        if not await account.is_visible():
+            switch = page.get_by_text(re.compile(r"^(Login jAccount|账号登录|密码登录|jAccount登录)$", re.I)).first
+            if await switch.is_visible():
+                await switch.click()
+        await account.wait_for(state="visible")
+        # Never include Playwright fill exceptions: its call log can contain the value.
+        try:
+            await account.fill(username.get_secret_value())
+            await page.locator('#input-login-pass, input[name="pass"]').first.fill(password.get_secret_value())
+        except Exception:
+            raise WorkflowError("无法填写 jAccount 表单；请在可见浏览器中完成登录") from None
+        captcha = page.locator('#input-login-captcha').first
+        for attempt in range(3):
+            if await captcha.is_visible():
+                model = self.settings.captcha_model_path.expanduser()
+                if not model.is_file():
+                    if not visible:
+                        raise WorkflowError("已配置账号，但缺少验证码模型；运行 windows/setup-auto-login.cmd 或使用可见浏览器")
+                    await self.report("账号密码已填写，请在浏览器填写验证码并登录")
+                    return
+                try:
+                    from .captcha import solve
+                    image = await page.locator('#captcha-img').screenshot()
+                    prediction = await asyncio.to_thread(solve, image, model)
+                    await captcha.fill(prediction)
+                except Exception:
+                    if not visible:
+                        raise WorkflowError("验证码组件不可用，请运行 setup-auto-login.cmd 或使用可见浏览器") from None
+                    await self.report("验证码识别失败，请在浏览器手动完成登录")
+                    return
+            await self.report(f"提交 jAccount 登录（{attempt + 1}/3）")
+            await page.locator('#submit-password-button').click()
             try:
-                await locator.click(timeout=3_000)
-                return True
+                await page.wait_for_url(lambda url: urlsplit(url).hostname != "jaccount.sjtu.edu.cn", timeout=20_000)
+                return
             except PlaywrightTimeoutError:
-                continue
-            except Exception:
-                continue
-        return False
-
-    async def _page_contains(self, page: Page, texts: list[str]) -> bool:
-        body = await page.locator("body").inner_text(timeout=5_000)
-        lowered = body.lower()
-        return any(text.lower() in lowered for text in texts)
-
-    async def _first_visible(self, locator: Locator) -> Locator:
-        found = await self._optional_first_visible(locator)
-        if found is None:
-            raise WorkflowError("No visible matching element found.")
-        return found
-
-    async def _optional_first_visible(self, locator: Locator) -> Locator | None:
-        count = await locator.count()
-        for index in range(min(count, 12)):
-            item = locator.nth(index)
-            try:
-                if await item.is_visible(timeout=1_000):
-                    return item
-            except Exception:
-                continue
-        return None
+                body = await page.locator("body").inner_text()
+                if re.search(r"验证码.*(错误|不正确)|captcha.*(incorrect|invalid|wrong)", body, re.I):
+                    # Only retry an explicitly incorrect CAPTCHA; never loop bad passwords.
+                    await page.locator('#captcha-img').click()
+                    await asyncio.sleep(0.5)
+                    continue
+                if not visible:
+                    raise WorkflowError("jAccount 未完成登录：请检查账号密码，或在可见浏览器完成二次认证") from None
+                await self.report("登录需要人工确认，请在浏览器处理错误或二次认证")
+                return
+        raise WorkflowError("验证码连续识别失败，请使用可见浏览器手动登录")

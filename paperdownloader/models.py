@@ -3,7 +3,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+from .textmatch import clean_doi
 
 
 class TaskStatus(StrEnum):
@@ -14,18 +15,28 @@ class TaskStatus(StrEnum):
 
 
 class DownloadRequest(BaseModel):
-    title: str = Field(min_length=3)
+    title: str = Field(min_length=3, max_length=2000)
+    doi: str = Field(default="", max_length=512)
     scholar_url: HttpUrl | None = None
     headless: bool | None = None
+
+    @field_validator("doi")
+    @classmethod
+    def normalize_doi(cls, value: str) -> str:
+        return clean_doi(value)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if len(value) < 3:
+            raise ValueError("Title must have at least three characters")
+        return value
 
 
 class DownloadResponse(BaseModel):
     task_id: str
     status: TaskStatus
-
-
-class CaptchaSubmission(BaseModel):
-    text: str = Field(min_length=1, max_length=12)
 
 
 class TaskSnapshot(BaseModel):
@@ -41,5 +52,5 @@ class TaskSnapshot(BaseModel):
 
 
 class WorkflowResult(BaseModel):
-    path: Path | None = None
+    path: Path
     metadata: dict[str, Any] = Field(default_factory=dict)

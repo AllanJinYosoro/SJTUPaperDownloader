@@ -1,105 +1,37 @@
+"""CPU inference for LightQuantumArchive/jaccount-captcha-solver v2.0.
+
+The model takes binary 0/1 pixels, not normalized grayscale; outputs are
+independent character heads, so repeated letters must not be collapsed.
+"""
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 
-import cv2
-import numpy as np
-import onnxruntime as ort
 
-from .config import Settings
-
-
-class CaptchaSolverError(RuntimeError):
-    pass
+@lru_cache(maxsize=1)
+def session(path: str):
+    import onnxruntime
+    options = onnxruntime.SessionOptions()
+    options.log_severity_level = 3
+    return onnxruntime.InferenceSession(path, sess_options=options, providers=["CPUExecutionProvider"])
 
 
-class JAccountCaptchaSolver:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.model_path = Path(settings.captcha_model_path)
-        self.charset = settings.captcha_charset
-        self._session: ort.InferenceSession | None = None
-        self.last_diagnostics: str = ""
-
-    def available(self) -> bool:
-        return self.model_path.exists()
-
-    def solve(self, image_bytes: bytes) -> str:
-        if not self.model_path.exists():
-            raise CaptchaSolverError(
-                f"Captcha model not found at {self.model_path}. Put the jAccount ONNX "
-                "model there or set CAPTCHA_MODEL_PATH."
-            )
-        session = self._get_session()
-        input_name = session.get_inputs()[0].name
-        outputs = session.run(None, {input_name: self._preprocess(image_bytes)})
-        self.last_diagnostics = self._diagnostics(session, outputs)
-        text = self._decode(outputs)
-        if not text:
-            raise CaptchaSolverError(
-                f"Captcha model returned an empty prediction. {self.last_diagnostics}"
-            )
-        return text
-
-    def _get_session(self) -> ort.InferenceSession:
-        if self._session is None:
-            self._session = ort.InferenceSession(
-                str(self.model_path),
-                providers=["CPUExecutionProvider"],
-            )
-        return self._session
-
-    def _preprocess(self, image_bytes: bytes) -> np.ndarray:
-        data = np.frombuffer(image_bytes, dtype=np.uint8)
-        image = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise CaptchaSolverError("Could not decode captcha image.")
-        image = cv2.resize(
-            image,
-            (self.settings.captcha_width, self.settings.captcha_height),
-            interpolation=cv2.INTER_AREA,
-        )
-        image = image.astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5
-        return image[np.newaxis, np.newaxis, :, :]
-
-    def _decode(self, output: object) -> str:
-        if isinstance(output, list) and len(output) > 1:
-            return self._decode_multi_head(output)
-
-        logits = np.asarray(output[0] if isinstance(output, list) else output)
-        if logits.ndim >= 2 and logits.shape[-1] in {len(self.charset), len(self.charset) + 1}:
-            indexes = logits.reshape(-1, logits.shape[-1]).argmax(axis=-1)
-        elif logits.ndim == 1:
-            indexes = logits.astype(np.int64)
-        else:
-            raise CaptchaSolverError(f"Unsupported captcha output shape: {logits.shape}")
-
-        chars: list[str] = []
-        blank_index = len(self.charset)
-        previous = None
-        for raw_index in indexes.tolist():
-            index = int(raw_index)
-            if index == previous:
-                continue
-            previous = index
-            if index == blank_index:
-                continue
-            if 0 <= index < len(self.charset):
-                chars.append(self.charset[index])
-        return "".join(chars)
-
-    def _decode_multi_head(self, outputs: list[object]) -> str:
-        chars: list[str] = []
-        for raw_logits in outputs:
-            logits = np.asarray(raw_logits)
-            if logits.ndim >= 2 and logits.shape[-1] in {len(self.charset), len(self.charset) + 1}:
-                index = int(logits.reshape(-1, logits.shape[-1])[0].argmax())
-            else:
-                index = int(logits.reshape(-1).argmax())
-            if 0 <= index < len(self.charset):
-                chars.append(self.charset[index])
-        return "".join(chars)
-
-    def _diagnostics(self, session: ort.InferenceSession, outputs: list[object]) -> str:
-        input_shapes = [(item.name, item.shape) for item in session.get_inputs()]
-        output_shapes = [np.asarray(item).shape for item in outputs]
-        return f"ONNX inputs={input_shapes}; outputs={output_shapes}"
+def solve(image_bytes: bytes, model: Path) -> str:
+    import numpy as np
+    from PIL import Image
+    inference = session(str(model.resolve()))
+    spec = inference.get_inputs()[0]
+    image = Image.open(BytesIO(image_bytes)).convert("L")
+    height, width = spec.shape[-2:]
+    if isinstance(height, int) and isinstance(width, int) and image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.NEAREST)
+    pixels = np.asarray(image, dtype=np.uint8)
+    inputs = (pixels >= 156).astype(np.float32)[None, None, :, :]
+    outputs = inference.run(None, {spec.name: inputs})
+    if len(outputs) not in (4, 5) or any(out.shape not in ((1, 26), (1, 27)) for out in outputs):
+        raise ValueError("验证码模型输出格式不支持，请使用指定的 v2.0 模型")
+    indexes = [int(out.argmax(axis=1)[0]) for out in outputs]
+    text = "".join(chr(ord("a") + index) for index in indexes if index < 26)
+    if len(text) not in (4, 5):
+        raise ValueError("验证码识别长度异常")
+    return text

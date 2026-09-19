@@ -20,6 +20,11 @@ class TaskStore:
             updated_at=now,
         )
         async with self._lock:
+            if len(self._tasks) >= 500:
+                finished = next((key for key, value in self._tasks.items()
+                                 if value.status in (TaskStatus.SUCCESS, TaskStatus.ERROR)), None)
+                if finished:
+                    del self._tasks[finished]
             self._tasks[task.task_id] = task
         return task
 

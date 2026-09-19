@@ -1,96 +1,37 @@
-const DEFAULTS = {
-  backendUrl: "http://127.0.0.1:8765",
-  headless: true
-};
+const DEFAULTS = { backendUrl: "http://127.0.0.1:8765", headless: false, token: "" };
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const current = await chrome.storage.sync.get(DEFAULTS);
-  await chrome.storage.sync.set({ ...DEFAULTS, ...current });
-});
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  handleMessage(message).then(sendResponse).catch((error) => {
-    sendResponse({ ok: false, error: error.message || String(error) });
-  });
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (sender.id !== chrome.runtime.id) return false;
+  handle(message).then(respond).catch(error => respond({ ok: false, error: error.message }));
   return true;
 });
 
-async function handleMessage(message) {
-  if (message?.type === "startDownload") {
-    return startDownload(message.payload);
+async function handle(message) {
+  const config = await chrome.storage.local.get(DEFAULTS);
+  const url = new URL(config.backendUrl);
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(url.hostname)) {
+    throw new Error("服务地址必须是本机 http://127.0.0.1:端口");
   }
-  if (message?.type === "getTask") {
-    return getTask(message.taskId);
+  if (!config.token) throw new Error("请先在插件设置填写服务配对码");
+  let path, body;
+  if (message.type === "startDownload") {
+    path = "/download";
+    body = { title: message.payload.title, scholar_url: message.payload.scholarUrl,
+             headless: config.headless };
+  } else if (message.type === "getTask" && /^[a-f0-9]{32}$/.test(message.taskId)) {
+    path = "/tasks/" + message.taskId;
+  } else if (message.type === "health") {
+    path = "/health";
+  } else {
+    throw new Error("Unknown message");
   }
-  if (message?.type === "submitCaptcha") {
-    return submitCaptcha(message.taskId, message.text);
-  }
-  if (message?.type === "health") {
-    return health();
-  }
-  return { ok: false, error: "Unknown message type" };
-}
-
-async function settings() {
-  const values = await chrome.storage.sync.get(DEFAULTS);
-  return {
-    backendUrl: normalizeBackendUrl(values.backendUrl || DEFAULTS.backendUrl),
-    headless: values.headless !== false
-  };
-}
-
-async function startDownload(payload) {
-  const config = await settings();
-  const response = await fetch(`${config.backendUrl}/download`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title: payload.title,
-      scholar_url: payload.scholarUrl,
-      headless: config.headless
-    })
+  const response = await fetch(url.origin + path, {
+    method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.token },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(15000)
   });
-  return parseResponse(response);
-}
-
-async function getTask(taskId) {
-  const config = await settings();
-  const response = await fetch(`${config.backendUrl}/tasks/${taskId}`);
-  return parseResponse(response);
-}
-
-async function submitCaptcha(taskId, text) {
-  const config = await settings();
-  const response = await fetch(`${config.backendUrl}/tasks/${taskId}/captcha`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text })
-  });
-  return parseResponse(response);
-}
-
-async function health() {
-  const config = await settings();
-  const response = await fetch(`${config.backendUrl}/health`);
-  return parseResponse(response);
-}
-
-async function parseResponse(response) {
-  let body = null;
-  try {
-    body = await response.json();
-  } catch (_error) {
-    body = {};
-  }
-  if (!response.ok) {
-    return {
-      ok: false,
-      error: body.detail || body.error || `HTTP ${response.status}`
-    };
-  }
-  return { ok: true, data: body };
-}
-
-function normalizeBackendUrl(value) {
-  return String(value).replace(/\/+$/, "");
+  const data = await response.json();
+  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+  return { ok: true, data };
 }
