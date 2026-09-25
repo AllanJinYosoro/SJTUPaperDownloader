@@ -33,6 +33,9 @@ class DownloadFilenameTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(path.parent, root)
                     self.assertEqual(path.read_bytes(), b"%PDF-test")
 
+            path = await workflow._resolve_download_path(b"%PDF-direct", "Direct")
+            self.assertEqual(path.read_bytes(), b"%PDF-direct")
+
             (root / "Same title.pdf").write_bytes(b"keep existing")
             path = await workflow._resolve_download_path(download, "Same title")
             self.assertEqual(path.name, "Same title-1.pdf")
