@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from time import monotonic
 from pathlib import Path
@@ -116,6 +117,7 @@ class ScholarDownloadWorkflow:
         attempts = []
         for name, handler in (("SJTU", None), ("SSRN", download_ssrn), ("Sci-Hub", download_scihub)):
             external = None
+            fallback_browser = None
             await self._report(f"trying {name}")
             try:
                 # Each source has a deadline so library timeouts still reach fallbacks.
@@ -123,12 +125,20 @@ class ScholarDownloadWorkflow:
                     if name == "SJTU":
                         result = await self._run_in_context(context, page, request.title)
                     else:
-                        external = await context.browser.new_context(accept_downloads=True)
-                        external.set_default_timeout(self.settings.navigation_timeout_ms)
-                        fallback_page = await external.new_page()
                         settings = self.settings.model_copy(update={
                             "headless": self.settings.headless if request.headless is None else request.headless,
                         })
+                        if name == "Sci-Hub":
+                            # System proxies can close Sci-Hub TLS connections; use its working direct route.
+                            fallback_browser = await context.browser.browser_type.launch(
+                                headless=settings.headless, args=["--no-proxy-server"],
+                                env={key: value for key, value in os.environ.items()
+                                     if key.lower() not in ("http_proxy", "https_proxy", "all_proxy")},
+                            )
+                        browser = fallback_browser or context.browser
+                        external = await browser.new_context(accept_downloads=True)
+                        external.set_default_timeout(self.settings.navigation_timeout_ms)
+                        fallback_page = await external.new_page()
                         data, metadata = await handler(fallback_page, request, settings, self._report)
                         path = await self._resolve_download_path(data, request.title)
                         result = WorkflowResult(path=path, metadata=metadata)
@@ -142,7 +152,9 @@ class ScholarDownloadWorkflow:
                 attempts.append({"source": name, "status": "unavailable", "reason": reason})
                 await self._report(f"{name} unavailable: {reason}")
             finally:
-                if external is not None:
+                if fallback_browser is not None:
+                    await fallback_browser.close()
+                elif external is not None:
                     await external.close()
         raise WorkflowError("All sources failed: " + "; ".join(f"{a['source']}: {a['reason']}" for a in attempts))
 

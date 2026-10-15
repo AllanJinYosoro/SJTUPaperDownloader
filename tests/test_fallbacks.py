@@ -81,8 +81,12 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
 
                 async def route(route):
                     url = route.request.url
-                    if "sci-hub.sg" in url:
-                        body = '<embed id="pdf" src="https://sci-hub.sg/paper.pdf">'
+                    if "sci-hub.ru" in url:
+                        body = '<iframe src="https://sci-net.xyz/storage/paper.pdf#view=FitH"></iframe>'
+                    elif "/storage/" in url:
+                        body = "PDF viewer"
+                    elif "sci-net.xyz" in url:
+                        body = '<iframe src="/storage/paper.pdf#view=FitH"></iframe>'
                     elif "searchresults.cfm" in url:
                         body = f'<a href="https://papers.ssrn.com/sol3/papers.cfm?abstract_id=123">{title}</a>'
                     else:

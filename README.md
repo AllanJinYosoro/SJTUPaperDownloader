@@ -92,5 +92,7 @@ uv run python -m paperdownloader.cli
   Crossref to resolve a unique matching title. SSRN manuscripts may differ from
   the published version. External sources use separate browser contexts and
   do not receive the library session. Site challenges may require visible mode.
+- Sci-Hub uses `sci-hub.ru` and accepts its `sci-net.xyz` PDF redirect. Its
+  separate browser connects directly, without inherited HTTP/SOCKS proxies.
 - `Jaccount_PWD` remains accepted for existing installations. Set
   `CAPTCHA_MODEL_PATH` to your actual model and `CAPTCHA_WIDTH` to its input width.

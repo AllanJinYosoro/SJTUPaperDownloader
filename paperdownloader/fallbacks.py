@@ -92,17 +92,17 @@ async def wait_public_page(page, selector, settings, report):
 async def download_scihub(page, request, settings, report):
     doi = await resolve_doi(page, request, settings)
     await report("Sci-Hub：按 DOI 查询")
-    await page.goto("https://sci-hub.sg/" + quote(doi, safe="/"), wait_until="domcontentloaded")
-    selector = '#pdf[src], embed[type="application/pdf"][src]'
+    await page.goto("https://sci-hub.ru/" + quote(doi, safe="/"), wait_until="domcontentloaded")
+    selector = 'iframe[src*="/storage/"], #pdf[src], embed[type="application/pdf"][src]'
     await wait_public_page(page, selector, settings, report)
     # Only follow the requested site's result, not an advertising/search redirect.
-    public_url(page.url, ("sci-hub.sg",))
+    public_url(page.url, ("sci-hub.ru", "sci-net.xyz"))
     body = await page.locator("body").inner_text()
     if doi.lower() not in unquote(page.url).lower() and doi.lower() not in body.lower():
         raise WorkflowError("Sci-Hub 结果不能核对目标 DOI")
     pdf = page.locator(selector).first
     url = urljoin(page.url, await pdf.get_attribute("src") or await pdf.get_attribute("href") or "")
-    return await fetch_pdf(page, url, ("sci-hub.sg", "sci.bban.top"), {
+    return await fetch_pdf(page, url, ("sci-hub.ru", "sci-net.xyz", "sci.bban.top"), {
         "source": "Sci-Hub", "resolved_doi": doi, "version": "unverified", "matched_title": request.title})
 
 
