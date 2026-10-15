@@ -87,7 +87,7 @@ async def _run_task(task_id: str, request: DownloadRequest) -> None:
             progress=lambda step: store.update(task_id, step=step),
             debug_dir=debug_dir,
         )
-        result = await workflow.run(request.title, headless=request.headless)
+        result = await workflow.run(request.title, doi=request.doi, headless=request.headless)
         await store.update(
             task_id,
             status=TaskStatus.SUCCESS,

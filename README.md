@@ -16,8 +16,8 @@ uv run python -m playwright install chromium
 Create `.env` from `.env.example` and fill:
 
 ```text
-Jaccount_Username=...
-Jaccount_PWD=...
+JACCOUNT_USERNAME=...
+JACCOUNT_PASSWORD=...
 PORT=8765
 CAPTCHA_MODEL_PATH=models/nn_model.onnx
 CAPTCHA_WIDTH=110
@@ -84,5 +84,13 @@ uv run python -m paperdownloader.cli
   without splitting Unicode characters, and `.pdf` is retained. Empty names use
   `paper.pdf`; reserved device names are prefixed with `_`. Existing files are
   preserved with `-1`, `-2`, etc. added before `.pdf`.
-- If Primo returns no result, if the first result title is too different, or if
-  ExLibris has no EBSCOhost source, the extension surfaces the service error.
+- Downloads try SJTU/EBSCO first, then SSRN, then Sci-Hub. Each source gets its
+  own `TASK_TIMEOUT_MS` deadline; unavailable sources and timeouts trigger the
+  next source. Results record the source and preceding failures. If all fail,
+  the error includes all three reasons.
+- The `/download` request accepts an optional `doi`. Without one, Sci-Hub uses
+  Crossref to resolve a unique matching title. SSRN manuscripts may differ from
+  the published version. External sources use separate browser contexts and
+  do not receive the library session. Site challenges may require visible mode.
+- `Jaccount_PWD` remains accepted for existing installations. Set
+  `CAPTCHA_MODEL_PATH` to your actual model and `CAPTCHA_WIDTH` to its input width.

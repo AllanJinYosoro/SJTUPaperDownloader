@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
@@ -12,6 +12,36 @@ from paperdownloader.workflow import ScholarDownloadWorkflow, WorkflowError
 
 
 class WorkflowDebugTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sfx_already_redirected_to_ebsco(self):
+        settings = Settings(_env_file=None)
+        workflow = ScholarDownloadWorkflow(settings, JAccountCaptchaSolver(settings))
+        page = Mock(url="https://research.ebsco.com/c/library/viewer/pdf/paper")
+        page.wait_for_function = AsyncMock()
+        self.assertIs(await workflow._open_ebsco_source(page), page)
+        page.evaluate.assert_not_called()
+
+    async def test_sfx_delayed_redirect_to_ebsco(self):
+        settings = Settings(_env_file=None)
+        workflow = ScholarDownloadWorkflow(settings, JAccountCaptchaSolver(settings))
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch()
+            try:
+                page = await browser.new_page()
+                destination = "https://research.ebsco.com/c/library/viewer/pdf/paper"
+
+                async def route(request):
+                    body = "PDF viewer" if request.request.url == destination else (
+                        f'<script>setTimeout(() => location.href = "{destination}", 1000)</script>'
+                    )
+                    await request.fulfill(content_type="text/html", body=body)
+
+                await page.route("**/*", route)
+                await page.goto("https://sfx.example.test/", wait_until="domcontentloaded")
+                result = await workflow._open_ebsco_source(page)
+                self.assertEqual(result.url, destination)
+            finally:
+                await browser.close()
+
     async def test_auth_redirect_without_body_is_not_a_failure(self):
         settings = Settings(_env_file=None)
         workflow = ScholarDownloadWorkflow(settings, JAccountCaptchaSolver(settings))
@@ -42,7 +72,9 @@ class WorkflowDebugTests(unittest.IsolatedAsyncioTestCase):
 
             workflow._open_sjtu_search = open_page
             workflow._validate_primo_first_result = stall
-            with self.assertRaisesRegex(WorkflowError, "matching paper title: TimeoutError"):
+            with patch("paperdownloader.fallbacks.download_ssrn", side_effect=WorkflowError("unavailable")), \
+                 patch("paperdownloader.fallbacks.download_scihub", side_effect=WorkflowError("unavailable")), \
+                 self.assertRaisesRegex(WorkflowError, "matching paper title: TimeoutError"):
                 await workflow.run("Test paper", headless=True)
             log = (root / "diagnostics" / "workflow.log").read_text(encoding="utf-8")
             self.assertIn("matching paper title", log)
@@ -53,6 +85,12 @@ class WorkflowDebugTests(unittest.IsolatedAsyncioTestCase):
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True)
                 page = await browser.new_page()
+                await page.set_content(
+                    '<h2>Login jAccount</h2><form onsubmit="event.preventDefault(); document.body.dataset.submitted=\'yes\'">'
+                    '<input type="password"><input type="submit" value="Login"></form>'
+                )
+                self.assertTrue(await workflow._submit_jaccount_login(page, page.locator('input[type="password"]')))
+                self.assertEqual(await page.locator("body").get_attribute("data-submitted"), "yes")
                 await page.set_content(
                     '<button onclick="this.textContent=&quot;Institution search opened&quot;">'
                     'Sign in through your institution</button>'

@@ -49,6 +49,7 @@ class DownloadFilenameTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(path.name.endswith(".pdf"))
                     self.assertLessEqual(len(str(path).encode("utf-16-le")) // 2, 259)
                     self.assertLessEqual(len(path.name.encode("utf-16-le")) // 2, 208)
+                    self.assertLessEqual(len(path.name.encode("utf-8")), 255)
                     self.assertNotIn("�", path.name)
                     self.assertEqual(path.read_bytes(), b"%PDF-test")
             settings.download_dir = root / ("x" * 250)

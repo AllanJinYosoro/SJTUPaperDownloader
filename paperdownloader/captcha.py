@@ -55,10 +55,10 @@ class JAccountCaptchaSolver:
         image = cv2.resize(
             image,
             (self.settings.captcha_width, self.settings.captcha_height),
-            interpolation=cv2.INTER_AREA,
+            interpolation=cv2.INTER_NEAREST,
         )
-        image = image.astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5
+        # The supplied jAccount model was trained on binary 0/1 pixels.
+        image = (image >= 156).astype(np.float32)
         return image[np.newaxis, np.newaxis, :, :]
 
     def _decode(self, output: object) -> str:

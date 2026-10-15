@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 from playwright.async_api import (
     BrowserContext,
     Download,
+    Error as PlaywrightError,
     Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
@@ -18,7 +19,7 @@ from playwright.async_api import (
 
 from .captcha import CaptchaSolverError, JAccountCaptchaSolver
 from .config import Settings
-from .models import WorkflowResult
+from .models import DownloadRequest, WorkflowResult
 from .textmatch import title_similarity
 
 
@@ -52,7 +53,8 @@ class ScholarDownloadWorkflow:
         if self.progress is not None:
             await self.progress(step)
 
-    async def run(self, title: str, *, headless: bool | None = None) -> WorkflowResult:
+    async def run(self, title: str, *, doi: str = "", headless: bool | None = None) -> WorkflowResult:
+        request = DownloadRequest(title=title, doi=doi, headless=headless)
         profile_dir = Path(self.settings.browser_profile_dir)
         download_dir = Path(self.settings.download_dir).expanduser()
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -78,10 +80,7 @@ class ScholarDownloadWorkflow:
                 context.set_default_timeout(self.settings.navigation_timeout_ms)
                 page = context.pages[0] if context.pages else await context.new_page()
                 try:
-                    result = await asyncio.wait_for(
-                        self._run_in_context(context, page, title),
-                        timeout=self.settings.task_timeout_ms / 1000,
-                    )
+                    result = await self._run_sources(context, page, request)
                     await self._report("download completed")
                     return result
                 except Exception as exc:
@@ -110,6 +109,42 @@ class ScholarDownloadWorkflow:
             if handler is not None:
                 self.logger.removeHandler(handler)
                 handler.close()
+
+    async def _run_sources(self, context: BrowserContext, page: Page, request: DownloadRequest) -> WorkflowResult:
+        from .fallbacks import download_scihub, download_ssrn
+
+        attempts = []
+        for name, handler in (("SJTU", None), ("SSRN", download_ssrn), ("Sci-Hub", download_scihub)):
+            external = None
+            await self._report(f"trying {name}")
+            try:
+                # Each source has a deadline so library timeouts still reach fallbacks.
+                async with asyncio.timeout(self.settings.task_timeout_ms / 1000):
+                    if name == "SJTU":
+                        result = await self._run_in_context(context, page, request.title)
+                    else:
+                        external = await context.browser.new_context(accept_downloads=True)
+                        external.set_default_timeout(self.settings.navigation_timeout_ms)
+                        fallback_page = await external.new_page()
+                        settings = self.settings.model_copy(update={
+                            "headless": self.settings.headless if request.headless is None else request.headless,
+                        })
+                        data, metadata = await handler(fallback_page, request, settings, self._report)
+                        path = await self._resolve_download_path(data, request.title)
+                        result = WorkflowResult(path=path, metadata=metadata)
+                    result.metadata.update(source=name, attempts=attempts + [{"source": name, "status": "success"}])
+                    return result
+            except (WorkflowError, PlaywrightError, TimeoutError) as exc:
+                reason = f"{self.step}: {str(exc) or type(exc).__name__}"
+                for secret in (self.settings.jaccount_username, self.settings.jaccount_password):
+                    if secret:
+                        reason = reason.replace(secret, "[redacted]")
+                attempts.append({"source": name, "status": "unavailable", "reason": reason})
+                await self._report(f"{name} unavailable: {reason}")
+            finally:
+                if external is not None:
+                    await external.close()
+        raise WorkflowError("All sources failed: " + "; ".join(f"{a['source']}: {a['reason']}" for a in attempts))
 
     async def _run_in_context(
         self,
@@ -219,7 +254,18 @@ class ScholarDownloadWorkflow:
         raise WorkflowError("Could not find the Primo full-text service link.")
 
     async def _open_ebsco_source(self, page: Page) -> Page:
-        await page.wait_for_load_state("networkidle")
+        # SFX can briefly render an empty document before redirecting to EBSCO.
+        try:
+            await page.wait_for_function(
+                """() => location.hostname === 'research.ebsco.com' ||
+                    [...document.querySelectorAll('tr[id^="tr_"]')]
+                        .some(row => /EBSCOhost/i.test(row.textContent || ''))""",
+                timeout=20_000,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise WorkflowError("SFX did not provide an EBSCO page or full-text source within 20 seconds.") from exc
+        if urlsplit(page.url).hostname == "research.ebsco.com":
+            return page
         row_id = await page.evaluate(
             """() => {
                 const row = [...document.querySelectorAll('tr[id^="tr_"]')]
@@ -364,7 +410,10 @@ class ScholarDownloadWorkflow:
         raise WorkflowError("JAccount login failed after captcha retries.")
 
     async def _submit_jaccount_login(self, page: Page, password: Locator) -> bool:
-        if not await self._try_click_text(page, ["登录", "Login", "Sign in"]):
+        submit = await self._optional_first_visible(page.locator('input[type="submit"], button[type="submit"]'))
+        if submit is not None:
+            await submit.click()
+        else:
             await password.press("Enter")
         await page.wait_for_timeout(2_000)
         return not await self._page_contains(page, ["验证码错误", "captcha incorrect"])
@@ -498,6 +547,7 @@ class ScholarDownloadWorkflow:
             raise WorkflowError("Download directory is too long for a PDF filename.")
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title).strip()
         name = name.encode("utf-16-le", errors="ignore")[:limit * 2].decode("utf-16-le", errors="ignore")
+        name = name.encode("utf-8")[:240].decode("utf-8", errors="ignore")
         name = name.rstrip(" .") or "paper"
         if isreserved(name + ".pdf"):
             name = ("_" + name).encode("utf-16-le")[:limit * 2].decode("utf-16-le", errors="ignore").rstrip(" .")

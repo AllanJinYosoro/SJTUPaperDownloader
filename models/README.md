@@ -7,7 +7,7 @@ models/jaccount_resnet.onnx
 ```
 
 The local service loads this file through `CAPTCHA_MODEL_PATH`. The expected
-input defaults are grayscale `1 x 1 x 40 x 100`, matching
+input defaults are binary 0/1 pixels (grayscale threshold 156), `1 x 1 x 40 x 110`, matching
 LightQuantumArchive/jaccount-captcha-solver's `nn_model.onnx`. The decoder
 accepts either multi-head character logits, sequence logits, or decoded
 character indexes. If the chosen model uses a different image size or alphabet,
@@ -15,7 +15,7 @@ set these in `.env`:
 
 ```text
 CAPTCHA_MODEL_PATH=models/jaccount_resnet.onnx
-CAPTCHA_WIDTH=100
+CAPTCHA_WIDTH=110
 CAPTCHA_HEIGHT=40
 CAPTCHA_CHARSET=abcdefghijklmnopqrstuvwxyz
 ```

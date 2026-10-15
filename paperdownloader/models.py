@@ -3,7 +3,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+from .textmatch import clean_doi
 
 
 class TaskStatus(StrEnum):
@@ -15,8 +17,14 @@ class TaskStatus(StrEnum):
 
 class DownloadRequest(BaseModel):
     title: str = Field(min_length=3)
+    doi: str = ""
     scholar_url: HttpUrl | None = None
     headless: bool | None = None
+
+    @field_validator("doi")
+    @classmethod
+    def validate_doi(cls, value: str) -> str:
+        return clean_doi(value)
 
 
 class DownloadResponse(BaseModel):

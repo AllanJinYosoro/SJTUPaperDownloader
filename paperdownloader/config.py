@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,11 +20,13 @@ class Settings(BaseSettings):
     download_dir: Path = Field(default_factory=lambda: Path.home() / "Downloads")
 
     jaccount_username: str | None = Field(default=None, alias="Jaccount_Username")
-    jaccount_password: str | None = Field(default=None, alias="Jaccount_PWD")
+    jaccount_password: str | None = Field(
+        default=None, validation_alias=AliasChoices("JACCOUNT_PASSWORD", "Jaccount_PWD")
+    )
 
     captcha_model_path: Path = Path("models/jaccount_resnet.onnx")
     captcha_charset: str = "abcdefghijklmnopqrstuvwxyz"
-    captcha_width: int = 100
+    captcha_width: int = 110
     captcha_height: int = 40
     captcha_max_retries: int = 3
 

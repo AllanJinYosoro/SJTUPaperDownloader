@@ -1,6 +1,14 @@
 from difflib import SequenceMatcher
 import re
 import unicodedata
+from urllib.parse import unquote
+
+
+def clean_doi(value: str) -> str:
+    value = unquote(re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", value.strip(), flags=re.I))
+    if value and not re.fullmatch(r"10\.\d{4,9}/\S+", value, re.I):
+        raise ValueError("Invalid DOI format")
+    return value.lower()
 
 
 def normalize_title(value: str) -> str:

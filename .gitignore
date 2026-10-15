@@ -22,3 +22,4 @@ wheels/
 .state/
 :memory:.ses
 /selected_papers.json
+/downloads/
