@@ -18,3 +18,7 @@ wheels/
 .debug-profile/
 .debug/
 .native-host-stage/
+.playwright-cli/
+.state/
+:memory:.ses
+/selected_papers.json
